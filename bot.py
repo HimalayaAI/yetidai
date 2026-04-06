@@ -114,7 +114,7 @@ async def on_message(message):
             if hasattr(response, 'choices') and len(response.choices) > 0:
                 ai_response = response.choices[0].message.content
             else:
-                ai_response = "I couldn't generate a response."
+                ai_response = "माफ गर्नुहोस्, मले जवाफ तैयार गर्न सकेन।"
 
             # Send the response back to Discord
             if ai_response:
@@ -124,7 +124,7 @@ async def on_message(message):
 
         except Exception as e:
             print(f"Error calling Sarvam AI: {e}")
-            await message.channel.send("Sorry, I encountered an error while processing your request.")
+            await message.channel.send("माफ गर्नुहोस्, अनुरोध प्रक्रिया गर्दा एक त्रुटि भेटिएको छ।")
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN or not SARVAM_API_KEY:
