@@ -77,7 +77,7 @@ async def on_message(message):
     async with message.channel.typing():
         try:
             # Fetch up to 10 previous messages for context
-            previous_messages = await get_message_history(message.channel, limit=10)
+            previous_messages = await get_message_history(message.channel, limit=5)
             
             # Prepare messages for Sarvam AI - include message history for context
             messages = [
