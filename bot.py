@@ -15,7 +15,7 @@ SARVAM_API_KEY = os.getenv('SARVAM_API_KEY')
 
 client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
 
-with open('system_prompt.txt', 'r', encoding='utf-8') as f:
+with open('systemPrompt.txt', 'r', encoding='utf-8') as f:
     SYSTEM_PROMPT = f.read()
 
 intents = discord.Intents.default()
