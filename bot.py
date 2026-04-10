@@ -1,10 +1,12 @@
 import discord
 import os
-import asyncio
 from dotenv import load_dotenv
 from sarvamai import AsyncSarvamAI
-import re
 from functionality import functional
+from context_formatter import build_context_brief
+from context_router import fetch_context_bundle
+from nepalosint_client import NepalOSINTClient
+from retrieval_planner import resolve_route_plan
 
 #<--------------------Initializing project---------------------------------->
 
@@ -14,6 +16,7 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 SARVAM_API_KEY = os.getenv('SARVAM_API_KEY')
 
 client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
+nepalosint_client = NepalOSINTClient()
 
 with open('systemPrompt.txt', 'r', encoding='utf-8') as f:
     SYSTEM_PROMPT = f.read()
@@ -43,10 +46,20 @@ async def on_message(message):
         try:
             # Get message history for context
             previous_messages = await chad.get_message_history(message.channel, limit=5)
+            route_plan = await resolve_route_plan(client, chad.user_input, previous_messages)
             
             messages = [
                 {"role": "system", "content": SYSTEM_PROMPT}
             ]
+
+            if route_plan.use_nepalosint:
+                context_bundle = await fetch_context_bundle(nepalosint_client, chad.user_input, route_plan)
+                context_message = build_context_brief(context_bundle, max_chars=1800)
+                if context_message:
+                    messages.append({
+                        "role": "system",
+                        "content": f"Current NepalOSINT context:\n{context_message}"
+                    })
             
             # Format previous messages
             for prev_msg in previous_messages:
