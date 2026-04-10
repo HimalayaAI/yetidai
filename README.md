@@ -1,6 +1,6 @@
-# yetidai
+# YetiDAI
 
-Himalaya AI discord bot
+NepalOSINT, live news, and macroeconomic awareness.
 
 ## Prerequisites
 - Python 3.8 or higher.
