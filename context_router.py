@@ -226,9 +226,9 @@ def route_query(query: str) -> RoutePlan:
     is_ticker_like = bool(re.search(r"\b[A-Z]{2,6}\b", query)) and not (is_macro or is_debt or is_parliament or is_government)
     is_trading = _contains_any(normalized, TRADING_KEYWORDS) or is_ticker_like
     is_general_news = _contains_any(normalized, GENERAL_KEYWORDS) or has_romanized_general
-    wants_history = _contains_any(normalized, HISTORY_KEYWORDS)
-
-    start_date, end_date = _extract_history_range(query) if wants_history else (None, None)
+    start_date, end_date = _extract_history_range(query)
+    has_explicit_history_range = bool(start_date and end_date)
+    wants_history = _contains_any(normalized, HISTORY_KEYWORDS) or has_explicit_history_range
 
     if is_macro:
         intents.append("macro")
@@ -275,7 +275,6 @@ async def fetch_context_bundle(client: Any, query: str, plan: RoutePlan) -> dict
 
     if "macro" in plan.intents:
         tasks["economy_snapshot"] = client.get_economy_snapshot()
-        tasks["economy_bootstrap"] = client.get_dashboard_bootstrap("economy")
 
     if "government" in plan.intents:
         tasks["govt_decisions"] = client.get_govt_decisions_latest(limit=min(10, max_items), dedupe=True)
