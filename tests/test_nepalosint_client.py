@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from typing import Any
 
-from nepalosint_client import NepalOSINTClient
+from tools.osint.nepalosint_client import NepalOSINTClient
 
 
 class FakeResponse:

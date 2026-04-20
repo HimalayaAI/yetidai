@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 
-from context_router import RoutePlan, fetch_context_bundle, route_query
+from tools.osint.context_router import RoutePlan, fetch_context_bundle, route_query
 
 
 class ContextRouterTests(unittest.TestCase):
