@@ -2,8 +2,8 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from context_router import RoutePlan, route_query
-from retrieval_planner import _extract_json_blob, _plan_from_payload, resolve_route_plan
+from tools.osint.context_router import RoutePlan, route_query
+from tools.osint.retrieval_planner import _extract_json_blob, _plan_from_payload, resolve_route_plan
 
 
 class RetrievalPlannerTests(unittest.TestCase):

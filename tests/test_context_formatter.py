@@ -1,7 +1,7 @@
 import unittest
 
-from context_formatter import build_context_brief
-from context_router import RoutePlan
+from tools.osint.context_formatter import build_context_brief
+from tools.osint.context_router import RoutePlan
 
 
 class ContextFormatterTests(unittest.TestCase):
