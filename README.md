@@ -1,14 +1,29 @@
-# YetiDAI
+# YetiDai
 
-NepalOSINT, live news, and macroeconomic awareness.
+A Discord agent powered by Sarvam AI that integrates natively with external tools like NepalOSINT for live news, macroeconomic data, and public information.
 
-## Prerequisites
+## Architecture
+
+YetiDai uses a **multi-turn tool-calling architecture** and relies on Sarvam AI's native `tool_choice="auto"` feature. Instead of explicitly trying to figure out intent with keywords, the bot exposes a **Tool Registry** to the LLM. 
+
+The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal_live_context`, intelligently selects which tools to call, and waits for YetiDai to execute them via the registry before producing the final formatted Nepali response.
+
+### Key Components
+
+- **`core/tool_contracts.py`**: Pydantic models mapping tool requirements (e.g. `ToolSpec`, `ToolParam`, `ToolResult`).
+- **`core/tool_registry.py`**: A thread-safe Tool Registry that tracks tools, handles asynchronous executions, and generates the `tools` array for the API client.
+- **`tools/osint/plugin.py`**: The NepalOSINT plugin which encapsulates retrieving recent Nepal news, macro data, public debt clocks, missing information, etc.
+
+## Setup
+
+### Prerequisites
 - Python 3.8 or higher.
 - A Discord Bot Token from the [Discord Developer Portal](https://discord.com/developers/applications).
 - An API Key from the [Sarvam AI Dashboard](https://dashboard.sarvam.ai/).  
 - optional [our model usages pre-trained model trained from himalayan ai nepali text corpus dataset (https://huggingface.co/datasets/himalaya-ai/nepali-corpus-compile)]
 
-## Setup
+### Installation
+
 1. Clone this repository (or copy the files).
 2. Install dependencies:
    ```bash
@@ -23,38 +38,85 @@ NepalOSINT, live news, and macroeconomic awareness.
    NEPALOSINT_TIMEOUT_SECONDS=8
    NEPALOSINT_MAX_CONTEXT_ITEMS=8
    ```
-4. Update `.env` with your real `DISCORD_TOKEN` and `SARVAM_API_KEY`.
 
-`NEPALOSINT_BASE_URL`, `NEPALOSINT_PUBLIC_AUTH_ENABLED`, `NEPALOSINT_TIMEOUT_SECONDS`, and `NEPALOSINT_MAX_CONTEXT_ITEMS` are optional. The defaults point to the public NepalOSINT API and are already set in `nepalosint_client.py`.
+*(Note: `NEPALOSINT_*` variables are optional and default to the public API).*
 
 ## Running the Bot
+
 ```bash
 python bot.py
 ```
 
-## How it works
 The bot listens for any message in the channels it has access to. Make sure the bot has `Message Content Intent` enabled in the Discord Developer Portal.
 
-Before sending a user message to Sarvam AI, YetiDAI decides whether it needs live Nepal public-information context. This is handled by `retrieval_planner.py` and `context_router.py`:
+## How Tool Calling Works
 
-1. `retrieval_planner.py` starts with keyword routing and, for ambiguous follow-up questions, asks Sarvam to return a small JSON retrieval plan.
-2. `context_router.py` maps the plan into NepalOSINT intents: `general_news`, `macro`, `government`, `debt`, `parliament`, and `trading`.
-3. `nepalosint_client.py` fetches the matching live data from NepalOSINT.
-4. `context_formatter.py` compresses those payloads into a short system message named `Current NepalOSINT context`.
-5. `bot.py` sends the system prompt, the NepalOSINT context, recent Discord history, and the current user message to Sarvam AI.
+When a user asks `"नेपालमा आज के भइरहेको छ?"` (What's happening in Nepal today?):
 
-The system prompt tells Yeti to treat NepalOSINT as authoritative for current Nepal public-information questions. When NepalOSINT context is used, Yeti must answer in Nepali and end with a `स्रोत:` section containing the most relevant sources.
+1. The bot gives the LLM the user's message plus a list of tools from the `ToolRegistry`.
+2. The LLM responds with `finish_reason: "tool_calls"` and requests `get_nepal_live_context`.
+3. The registry executes the `tools.osint` plugin handler, fetching data from the NepalOSINT API.
+4. The bot attaches the tool execution result into the conversation and queries the LLM again.
+5. The LLM processes the live contextual data and returns a final text answer to the user containing the most relevant sources.
 
-## NepalOSINT coverage
-YetiDAI currently uses NepalOSINT for:
+## How to Add New Tools
 
-- Recent Nepal news and consolidated story history.
-- NRB-style macroeconomic snapshot data such as inflation, remittance, reserves, trade, tourism, migration, money supply, and banking indicators.
-- Government decisions and official announcements.
-- Nepal public debt clock and debt-related news.
-- Federal Parliament session summaries and tracked bills.
-- NEPSE, ticker-like, company, IPO, dividend, right-share, and market-related searches.
+Adding plugins to the bot is seamless and requires minimal rewiring in the main loop. Every tool needs to define a `ToolSpec` and an asynchronous handler.
 
-For historical questions such as `yesterday`, `last week`, or explicit `YYYY-MM-DD` ranges, YetiDAI requests NepalOSINT history data and preserves the time range in the answer.
+### 1. Create your plugin
+Create a new file in `tools/` (e.g. `tools/n8n/plugin.py`):
 
-If NepalOSINT cannot be reached, the formatter injects a fallback context telling the model that live context could not be fetched. The system prompt then requires Yeti to say that limitation instead of inventing current facts.
+```python
+from core.tool_contracts import ToolSpec, ToolParam, ToolCategory, ToolResult, ToolContext
+from core.tool_registry import get_registry
+
+# Define your tool spec
+MY_TOOL_SPEC = ToolSpec(
+    tool_id="automation.n8n.trigger_workflow",
+    name="trigger_n8n_workflow",
+    description="Trigger an n8n automation workflow.",
+    category=ToolCategory.AUTOMATION,
+    parameters=[
+        ToolParam(name="workflow_name", type="string", description="Name of the workflow to run.", required=True),
+    ],
+)
+
+# Define the async handler
+async def handle_n8n(ctx: ToolContext, arguments: dict) -> ToolResult:
+    workflow = arguments.get("workflow_name")
+    
+    # ... your custom logic here ...
+    
+    return ToolResult(
+        tool_id=MY_TOOL_SPEC.tool_id,
+        success=True,
+        content=f"Successfully triggered {workflow}."
+    )
+
+# Self-Register
+def register() -> None:
+    get_registry().register(MY_TOOL_SPEC, handle_n8n)
+```
+
+### 2. Register it in `bot.py`
+To expose your new tool, import it and trigger the `register()` method at the top of `bot.py`:
+
+```python
+# In bot.py, near the top:
+import tools.n8n.plugin as n8n_plugin
+n8n_plugin.register()
+```
+
+That's it! The registry will now pass the new JSON schema spec to the LLM on every message, and automatically route matching `tool_calls` generated by the model to your `handle_n8n` function.
+
+## Unit Testing
+We use `pytest` for all core, logic, component, and plugin tests.
+
+```bash
+python -m pytest tests/ -v
+```
+
+For live integration tests interacting with actual external services (e.g., Sarvam APIs and NepalOSINT):
+```bash
+python tests/test_tool_call_local.py "नेपालमा आज के भइरहेको छ?"
+```
