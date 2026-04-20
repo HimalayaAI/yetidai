@@ -79,16 +79,26 @@ async def on_message(message):
                 message.channel, limit=5,
             )
 
+            import datetime
+            today_str = datetime.date.today().strftime("%Y-%m-%d")
+            dynamic_system_prompt = f"{SYSTEM_PROMPT}\n\n# CURRENT DATE:\nToday's Date is: {today_str}"
+
             # Build the message list
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages = [{"role": "system", "content": dynamic_system_prompt}]
 
             # Format previous messages
             for prev_msg in previous_messages:
                 if prev_msg.id != message.id and prev_msg.content.strip():
-                    messages.append({
-                        "role": "user",
-                        "content": f"{prev_msg.author.name}: {prev_msg.content}",
-                    })
+                    if prev_msg.author == bot.user:
+                        messages.append({
+                            "role": "assistant",
+                            "content": prev_msg.content,
+                        })
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": f"{prev_msg.author.name}: {prev_msg.content}",
+                        })
 
             # Add current user message
             messages.append({"role": "user", "content": chad.user_input})
