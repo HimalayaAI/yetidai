@@ -11,9 +11,10 @@ class functional:
     async def get_message_history(self, channel, limit=5):
         messages = []
         async for msg in channel.history(limit=limit, oldest_first=False):
-            if msg.author != self.bot.user and not msg.author.bot:         #! system msg ra afno msg ignore garcha context ma
+            # Include our own bot's messages, but ignore other bots
+            if msg.author == self.bot.user or not msg.author.bot:
                 messages.append(msg)
-        
+
         messages.reverse() 
         return messages
     
