@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.tool_registry import get_registry
 from core.tool_contracts import ToolContext
 import tools.osint.plugin as osint_plugin
+import tools.search.plugin as search_plugin
 
 # ── Setup ─────────────────────────────────────────────────────────
 
@@ -36,11 +37,13 @@ llm_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
 with open("systemPrompt.txt", "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
 
-# Register OSINT plugin
+# Register plugins
 osint_plugin.register()
+search_plugin.register()
+
 registry = get_registry()
 
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 5
 
 
 async def simulate_bot_flow(user_query: str) -> None:

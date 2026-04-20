@@ -3,3 +3,4 @@ python-dotenv
 sarvamai
 httpx
 pydantic
+duckduckgo-search==8.1.1

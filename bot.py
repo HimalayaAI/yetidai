@@ -26,8 +26,10 @@ from core.tool_contracts import ToolContext
 
 # ── Register plugins ──────────────────────────────────────────────
 import tools.osint.plugin as osint_plugin
-osint_plugin.register()
+import tools.search.plugin as search_plugin
 
+osint_plugin.register()
+search_plugin.register()
 # ── Initialization ────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -52,7 +54,7 @@ chad = functional(bot=bot)
 registry = get_registry()
 
 # Safety cap: max tool-call round-trips before forcing a text answer
-MAX_TOOL_ROUNDS = 3
+MAX_TOOL_ROUNDS = 5
 
 
 @bot.event
