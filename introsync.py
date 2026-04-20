@@ -646,7 +646,6 @@ async def call_sarvam_for_chunk(
     session: aiohttp.ClientSession,
     config: IntroSyncConfig,
     chunk_content: str,
-    debug_raw_response: bool = False,
 ) -> tuple[str, str, str]:
     user_prompt = USER_PROMPT_TEMPLATE.replace("__CHUNK_CONTENT__", chunk_content)
 
@@ -684,9 +683,6 @@ async def call_sarvam_for_chunk(
                 f"Invalid API JSON: {exc}",
                 raw_response=raw_text,
             ) from exc
-        if debug_raw_response:
-            print("[DEBUG] Raw Sarvam response:", json.dumps(response_json, indent=2))
-
         choices = response_json.get("choices") if isinstance(response_json, dict) else None
         first_choice = choices[0] if isinstance(choices, list) and choices else {}
         message_obj = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
@@ -778,22 +774,25 @@ def intro_row_from_result(
 
 async def classify_messages(
     config: IntroSyncConfig, messages: list[discord.Message]
-) -> tuple[list[list[str]], int]:
+) -> tuple[list[list[str]], int, discord.Message | None]:
     chunks = build_chunks(messages)
     log(f"Built {len(chunks)} chunks. Sending to Sarvam...")
 
     intro_rows: list[list[str]] = []
     analyzed_count = 0
     successful_chunks = 0
+    checkpoint_message: discord.Message | None = None
+    can_advance_checkpoint = True
 
     async with aiohttp.ClientSession() as session:
         for chunk_index, (chunk_content, id_map) in enumerate(chunks, start=1):
+            chunk_messages = list(id_map.values())
+            chunk_last_message = chunk_messages[-1] if chunk_messages else None
             try:
                 model_content, raw_api_response, finish_reason = await call_sarvam_for_chunk(
                     session=session,
                     config=config,
                     chunk_content=chunk_content,
-                    debug_raw_response=(chunk_index == 1),
                 )
             except Exception as exc:
                 raw_hint = ""
@@ -803,6 +802,7 @@ async def classify_messages(
                     f"[API ERROR] Chunk {chunk_index}/{len(chunks)} failed — "
                     f"{exc.__class__.__name__}: {exc}{raw_hint}"
                 )
+                can_advance_checkpoint = False
                 if chunk_index < len(chunks):
                     await asyncio.sleep(1)
                 continue
@@ -832,12 +832,12 @@ async def classify_messages(
                         f"object extraction ({len(result_array)} objects)."
                     )
                 else:
-                    print("[DEBUG] Failed to parse cleaned content:", content[:500])
                     log(
                         f"[API ERROR] Chunk {chunk_index}/{len(chunks)} failed — "
                         f"JSONDecodeError: invalid JSON after cleaning | "
                         f"Raw: {(raw_api_response or '')[:300]}"
                     )
+                    can_advance_checkpoint = False
                     if chunk_index < len(chunks):
                         await asyncio.sleep(1)
                     continue
@@ -847,10 +847,13 @@ async def classify_messages(
                     f"[API ERROR] Chunk {chunk_index}/{len(chunks)} — skipped "
                     "(response is not a JSON array)."
                 )
+                can_advance_checkpoint = False
                 if chunk_index < len(chunks):
                     await asyncio.sleep(1)
                 continue
             successful_chunks += 1
+            if can_advance_checkpoint and chunk_last_message is not None:
+                checkpoint_message = chunk_last_message
 
             if finish_reason == "length":
                 log(
@@ -890,7 +893,7 @@ async def classify_messages(
             if chunk_index < len(chunks):
                 await asyncio.sleep(1)
 
-    return intro_rows, successful_chunks
+    return intro_rows, successful_chunks, checkpoint_message
 
 
 async def fetch_non_bot_messages(
@@ -965,13 +968,14 @@ class IntroSyncClient(discord.Client):
 
         if first_run:
             if messages:
-                intro_rows, successful_chunks = await classify_messages(
+                intro_rows, successful_chunks, checkpoint_message = await classify_messages(
                     config=self.config,
                     messages=messages,
                 )
             else:
                 intro_rows = []
                 successful_chunks = 0
+                checkpoint_message = None
 
             if messages and successful_chunks == 0:
                 log("[WARN] All chunks failed. State not saved. Will retry full scan next cycle.")
@@ -981,9 +985,13 @@ class IntroSyncClient(discord.Client):
             reset_sheet_with_headers(worksheet)
             append_intro_rows(worksheet, deduped_rows)
 
-            if messages:
-                newest = messages[-1]
-                write_sync_state(newest.id, newest.created_at.isoformat())
+            if checkpoint_message is not None:
+                write_sync_state(checkpoint_message.id, checkpoint_message.created_at.isoformat())
+                if checkpoint_message.id != messages[-1].id:
+                    log(
+                        "[WARN] Partial chunk failure detected. "
+                        "State saved to last contiguous successful chunk only."
+                    )
             else:
                 write_sync_state(None, None)
 
@@ -997,7 +1005,7 @@ class IntroSyncClient(discord.Client):
             log("No new messages. Waiting for next cycle.")
             return
 
-        intro_rows, successful_chunks = await classify_messages(
+        intro_rows, successful_chunks, checkpoint_message = await classify_messages(
             config=self.config,
             messages=messages,
         )
@@ -1009,8 +1017,16 @@ class IntroSyncClient(discord.Client):
         if deduped_rows:
             await upsert_rows_into_sheet(self.config, worksheet, deduped_rows)
 
-        newest = messages[-1]
-        write_sync_state(newest.id, newest.created_at.isoformat())
+        if checkpoint_message is not None:
+            write_sync_state(checkpoint_message.id, checkpoint_message.created_at.isoformat())
+            if checkpoint_message.id != messages[-1].id:
+                log(
+                    "[WARN] Partial chunk failure detected. "
+                    "State saved to last contiguous successful chunk only."
+                )
+        else:
+            log("[WARN] First chunk failed. State not advanced; pending messages will be retried.")
+            return
 
         log(
             f"Sync complete. {len(deduped_rows)} introductions out of "
