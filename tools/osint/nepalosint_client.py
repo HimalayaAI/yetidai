@@ -1,8 +1,33 @@
+import json
 import os
 import time
 from typing import Any
 
 import httpx
+
+
+# Per-endpoint TTL (seconds). Path-prefix match, first hit wins. 0 = no cache.
+_TTL_RULES: tuple[tuple[str, int], ...] = (
+    ("/auth/public", 0),
+    ("/analytics/consolidated-stories", 60),          # realtime news
+    ("/analytics/history", 3600),                     # historical, stable
+    ("/economy/nrb-snapshot", 600),                   # macro data, 10 min
+    ("/debt-clock", 300),                             # PDMO debt clock, 5 min
+    ("/govt-decisions", 120),                         # cabinet updates, 2 min
+    ("/announcements", 120),
+    ("/verbatim", 300),                               # parliament sessions
+    ("/parliament", 300),
+    ("/search", 120),
+    ("/embeddings", 120),
+    ("/dashboard", 180),
+)
+
+
+def _ttl_for(path: str) -> int:
+    for prefix, ttl in _TTL_RULES:
+        if path.startswith(prefix):
+            return ttl
+    return 60
 
 
 class NepalOSINTClient:
@@ -20,6 +45,10 @@ class NepalOSINTClient:
         self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout_seconds, follow_redirects=True)
         self._access_token: str | None = None
         self._token_expiry_epoch = 0.0
+        # key = (method, path, params_json, body_json) → (expires_at, value)
+        self._cache: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -45,6 +74,17 @@ class NepalOSINTClient:
         self._token_expiry_epoch = now + expires_in if expires_in else now + 3600
         return self._access_token
 
+    def _cache_key(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None,
+        json_body: dict[str, Any] | None,
+    ) -> tuple[str, str, str, str]:
+        params_json = json.dumps(params or {}, sort_keys=True, default=str)
+        body_json = json.dumps(json_body or {}, sort_keys=True, default=str)
+        return (method.upper(), path, params_json, body_json)
+
     async def _request(
         self,
         method: str,
@@ -55,6 +95,18 @@ class NepalOSINTClient:
         auth_preferred: bool = False,
         retry_on_auth: bool = True,
     ) -> Any:
+        ttl = _ttl_for(path)
+        cache_key = self._cache_key(method, path, params, json_body) if ttl > 0 else None
+
+        if cache_key is not None:
+            cached = self._cache.get(cache_key)
+            if cached is not None and cached[0] > time.time():
+                self.cache_hits += 1
+                return cached[1]
+
+        if cache_key is not None:
+            self.cache_misses += 1
+
         headers: dict[str, str] = {}
 
         if auth_preferred:
@@ -75,7 +127,12 @@ class NepalOSINTClient:
                 )
 
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+
+        if cache_key is not None:
+            self._cache[cache_key] = (time.time() + ttl, data)
+
+        return data
 
     async def get_economy_snapshot(self) -> Any:
         return await self._request("GET", "/economy/nrb-snapshot")

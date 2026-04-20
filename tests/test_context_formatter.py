@@ -19,7 +19,9 @@ class ContextFormatterTests(unittest.TestCase):
             }
         )
         self.assertIsNotNone(brief)
-        self.assertIn("live context अहिले ल्याउन सकिएन", brief)
+        # When everything fails, the formatter returns the machine-readable
+        # marker; bot.py detects it and auto-falls-back to internet_search.
+        self.assertIn("[NEPALOSINT_FETCH_FAILED]", brief)
 
     def test_builds_history_and_macro_blocks_with_footer(self) -> None:
         brief = build_context_brief(
@@ -61,8 +63,9 @@ class ContextFormatterTests(unittest.TestCase):
         self.assertIsNotNone(brief)
         self.assertIn("Historical news", brief)
         self.assertIn("Macro snapshot", brief)
-        self.assertIn("उत्तर दिने नियम:", brief)
-        self.assertIn("प्राथमिक स्रोतहरू:", brief)
+        # Footer is a single SOURCES: line (Nepali footer and "उत्तर दिने
+        # नियम:" were removed in the Claude-native rewrite).
+        self.assertIn("SOURCES:", brief)
 
 
 if __name__ == "__main__":
