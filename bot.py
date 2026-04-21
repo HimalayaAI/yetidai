@@ -102,14 +102,38 @@ def _split_body_and_sources(answer: str) -> tuple[str, str]:
     return answer[:idx].rstrip(), answer[idx:].strip()
 
 
+def _chunk_for_discord(text: str, limit: int = 2000) -> list[str]:
+    """Break text into Discord-sized chunks at a newline or whitespace boundary.
+
+    Prefers the last newline inside the window, then the last whitespace; only
+    falls back to a hard slice when no boundary exists in the window (e.g. an
+    unbroken URL or single long token).
+    """
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = window.rfind("\n")
+        if cut < limit // 2:
+            ws = window.rfind(" ")
+            if ws > cut:
+                cut = ws
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
     """Send answer; attach a citations embed when we have URLs."""
     body, sources_line = _split_body_and_sources(answer)
     text = body if (citation_urls and body) else answer
 
-    # Chunk body text at 2000 chars (Discord hard cap).
-    for i in range(0, len(text), 2000):
-        await channel.send(text[i : i + 2000])
+    for chunk in _chunk_for_discord(text, 2000):
+        await channel.send(chunk)
 
     if citation_urls:
         embed = discord.Embed(

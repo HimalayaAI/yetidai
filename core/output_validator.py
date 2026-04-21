@@ -36,31 +36,32 @@ _LOANWORD_WHITELIST = {
 }
 
 
+_DEVANAGARI_SPAN_RE = re.compile(r"[ऀ-ॿ]+")
+_LOANWORD_BOUNDARY_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _LOANWORD_WHITELIST) + r")\b",
+    flags=re.IGNORECASE,
+)
+
+
 def _ascii_run_length(text: str) -> int:
-    """Longest contiguous block of 'mostly ASCII letters' in text."""
+    """Length of the longest stretch of Latin-script prose between Devanagari.
+
+    A "run" is a contiguous span of the input that contains at least one ASCII
+    letter and no Devanagari characters. URLs and whitelisted loanwords are
+    blanked out first so they do not inflate the run. Short connector words
+    (e.g. "is", "to", "in") are intentionally counted — they are still English
+    prose.
+    """
     # Strip URLs first — a URL shouldn't count as English prose.
-    no_urls = re.sub(r"https?://\S+", " ", text)
-    # Strip digits, punctuation, and whitespace.
-    letters_only = re.sub(r"[^A-Za-z\s]", " ", no_urls)
-    # Strip whitelisted loanwords token-by-token.
-    kept: list[str] = []
-    for tok in letters_only.split():
-        if tok in _LOANWORD_WHITELIST or tok.upper() in _LOANWORD_WHITELIST:
-            continue
-        kept.append(tok)
-    # Join back and measure longest consecutive run of ≥3-char ASCII words.
-    runs: list[str] = []
-    current: list[str] = []
-    for tok in kept:
-        if len(tok) >= 3:
-            current.append(tok)
-        else:
-            if current:
-                runs.append(" ".join(current))
-                current = []
-    if current:
-        runs.append(" ".join(current))
-    return max((len(r) for r in runs), default=0)
+    scrubbed = re.sub(r"https?://\S+", " ", text)
+    # Remove whitelisted loanwords so a lone "NEPSE" doesn't register as prose.
+    scrubbed = _LOANWORD_BOUNDARY_RE.sub(" ", scrubbed)
+
+    max_run = 0
+    for span in _DEVANAGARI_SPAN_RE.split(scrubbed):
+        if re.search(r"[A-Za-z]", span):
+            max_run = max(max_run, len(span.strip()))
+    return max_run
 
 
 def _split_body_and_sources(answer: str) -> tuple[str, str]:

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import time
@@ -47,6 +48,8 @@ class NepalOSINTClient:
         self._token_expiry_epoch = 0.0
         # key = (method, path, params_json, body_json) → (expires_at, value)
         self._cache: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
+        # Single-flight: concurrent callers for the same key await one fetch.
+        self._inflight: dict[tuple[str, str, str, str], asyncio.Future[Any]] = {}
         self.cache_hits = 0
         self.cache_misses = 0
 
@@ -85,28 +88,16 @@ class NepalOSINTClient:
         body_json = json.dumps(json_body or {}, sort_keys=True, default=str)
         return (method.upper(), path, params_json, body_json)
 
-    async def _request(
+    async def _fetch(
         self,
         method: str,
         path: str,
         *,
-        params: dict[str, Any] | None = None,
-        json_body: dict[str, Any] | None = None,
-        auth_preferred: bool = False,
-        retry_on_auth: bool = True,
+        params: dict[str, Any] | None,
+        json_body: dict[str, Any] | None,
+        auth_preferred: bool,
+        retry_on_auth: bool,
     ) -> Any:
-        ttl = _ttl_for(path)
-        cache_key = self._cache_key(method, path, params, json_body) if ttl > 0 else None
-
-        if cache_key is not None:
-            cached = self._cache.get(cache_key)
-            if cached is not None and cached[0] > time.time():
-                self.cache_hits += 1
-                return cached[1]
-
-        if cache_key is not None:
-            self.cache_misses += 1
-
         headers: dict[str, str] = {}
 
         if auth_preferred:
@@ -127,12 +118,57 @@ class NepalOSINTClient:
                 )
 
         response.raise_for_status()
-        data = response.json()
+        return response.json()
 
-        if cache_key is not None:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        auth_preferred: bool = False,
+        retry_on_auth: bool = True,
+    ) -> Any:
+        ttl = _ttl_for(path)
+        cache_key = self._cache_key(method, path, params, json_body) if ttl > 0 else None
+
+        if cache_key is None:
+            return await self._fetch(
+                method, path,
+                params=params, json_body=json_body,
+                auth_preferred=auth_preferred, retry_on_auth=retry_on_auth,
+            )
+
+        cached = self._cache.get(cache_key)
+        if cached is not None and cached[0] > time.time():
+            self.cache_hits += 1
+            return cached[1]
+
+        # Another coroutine is already fetching this key — piggy-back on it.
+        inflight = self._inflight.get(cache_key)
+        if inflight is not None:
+            return await inflight
+
+        self.cache_misses += 1
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        self._inflight[cache_key] = fut
+        try:
+            data = await self._fetch(
+                method, path,
+                params=params, json_body=json_body,
+                auth_preferred=auth_preferred, retry_on_auth=retry_on_auth,
+            )
             self._cache[cache_key] = (time.time() + ttl, data)
-
-        return data
+            fut.set_result(data)
+            return data
+        except BaseException as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+            raise
+        finally:
+            self._inflight.pop(cache_key, None)
 
     async def get_economy_snapshot(self) -> Any:
         return await self._request("GET", "/economy/nrb-snapshot")
