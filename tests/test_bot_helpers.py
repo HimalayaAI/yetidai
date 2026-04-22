@@ -10,15 +10,21 @@ import pytest
 from core.bot_helpers import (
     DISCORD_EMBED_FIELD_VALUE_LIMIT,
     GENERIC_TECH_ERROR,
+    TOOL_DEDUP_MARKER,
+    TOOL_ERROR_MARKER,
+    TOOL_TIMEOUT_MARKER,
     chunk_for_discord,
     classify_llm_error,
     ensure_sources_line,
     extract_urls,
+    hash_tool_call,
     is_bot_apology,
+    is_real_tool_content,
     is_transient_llm_error,
     normalize_digits,
     safe_field_value,
     split_body_and_sources,
+    tool_calls_signature,
     with_turn_id,
 )
 
@@ -279,3 +285,122 @@ def test_with_turn_id_still_matches_apology_filter():
     """Turn-id-decorated apologies must still be detected by is_bot_apology
     so they don't poison the next turn's history."""
     assert is_bot_apology(with_turn_id(GENERIC_TECH_ERROR, "cafef00d"))
+
+
+# ── hash_tool_call ───────────────────────────────────────────────────
+
+def test_hash_tool_call_stable_across_key_order():
+    """Arg dict key order must not affect the signature — json sort_keys."""
+    a = hash_tool_call("search", {"q": "नेपाल", "limit": 5})
+    b = hash_tool_call("search", {"limit": 5, "q": "नेपाल"})
+    assert a == b
+
+
+def test_hash_tool_call_differs_on_args():
+    assert hash_tool_call("search", {"q": "a"}) != hash_tool_call("search", {"q": "b"})
+
+
+def test_hash_tool_call_differs_on_name():
+    assert hash_tool_call("a", {"q": "x"}) != hash_tool_call("b", {"q": "x"})
+
+
+def test_hash_tool_call_handles_empty_args():
+    # Empty args must still yield a deterministic hash.
+    h = hash_tool_call("search", {})
+    assert isinstance(h, str) and len(h) > 0
+
+
+def test_hash_tool_call_handles_none_args():
+    assert hash_tool_call("search", None) == hash_tool_call("search", {})
+
+
+# ── tool_calls_signature ─────────────────────────────────────────────
+
+class _FakeFunction:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCall:
+    def __init__(self, name, arguments, call_id="tc_1"):
+        self.id = call_id
+        self.function = _FakeFunction(name, arguments)
+
+
+def test_tool_calls_signature_order_invariant():
+    """Swapping the order of parallel tool_calls must not change the round signature.
+
+    Load-bearing: bot.py uses this to detect "two rounds of identical calls".
+    If order changed the signature, every parallel round would look novel.
+    """
+    a = _FakeToolCall("search", '{"q":"a"}', "1")
+    b = _FakeToolCall("osint", '{"subject":"b"}', "2")
+    assert tool_calls_signature([a, b]) == tool_calls_signature([b, a])
+
+
+def test_tool_calls_signature_detects_repeat():
+    """Same (name, args) across two rounds → same signature → loop detection fires."""
+    r1 = [_FakeToolCall("search", '{"q":"नेपाल"}', "1")]
+    r2 = [_FakeToolCall("search", '{"q":"नेपाल"}', "2")]  # new id, same call
+    assert tool_calls_signature(r1) == tool_calls_signature(r2)
+
+
+def test_tool_calls_signature_distinguishes_different_args():
+    r1 = [_FakeToolCall("search", '{"q":"a"}', "1")]
+    r2 = [_FakeToolCall("search", '{"q":"b"}', "2")]
+    assert tool_calls_signature(r1) != tool_calls_signature(r2)
+
+
+def test_tool_calls_signature_empty():
+    assert tool_calls_signature([]) == ()
+
+
+def test_tool_calls_signature_handles_malformed_args_json():
+    """Bad JSON in arguments must not crash signature computation."""
+    bad = _FakeToolCall("search", "{not-json", "1")
+    sig = tool_calls_signature([bad])
+    assert len(sig) == 1
+
+
+# ── is_real_tool_content ─────────────────────────────────────────────
+
+class _FakeResult:
+    def __init__(self, success, content):
+        self.success = success
+        self.content = content
+
+
+def test_is_real_tool_content_accepts_good_result():
+    assert is_real_tool_content(_FakeResult(True, "नेपालमा मुद्रास्फीति ५.२%"))
+
+
+def test_is_real_tool_content_rejects_failure():
+    assert not is_real_tool_content(_FakeResult(False, "नेपालमा मुद्रास्फीति ५.२%"))
+
+
+def test_is_real_tool_content_rejects_empty():
+    assert not is_real_tool_content(_FakeResult(True, ""))
+    assert not is_real_tool_content(_FakeResult(True, None))
+    assert not is_real_tool_content(_FakeResult(True, "   \n  "))
+
+
+def test_is_real_tool_content_rejects_tool_error_marker():
+    content = f"{TOOL_ERROR_MARKER} internet_search failed internally."
+    assert not is_real_tool_content(_FakeResult(False, content))
+
+
+def test_is_real_tool_content_rejects_tool_timeout_marker():
+    content = f"{TOOL_TIMEOUT_MARKER} osint_lookup exceeded 15s."
+    assert not is_real_tool_content(_FakeResult(False, content))
+
+
+def test_is_real_tool_content_rejects_dedup_marker_even_on_success():
+    """A dedup replay must not re-trigger tool_was_used — it wasn't a fresh hit."""
+    content = f"{TOOL_DEDUP_MARKER} search already executed.\n(real body here)"
+    # Even when success=True (cached result), dedup content signals "already counted".
+    assert not is_real_tool_content(_FakeResult(True, content))
+
+
+def test_is_real_tool_content_rejects_none():
+    assert not is_real_tool_content(None)

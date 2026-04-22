@@ -5,17 +5,21 @@ Kept deliberately free of the `discord` and `sarvamai` imports so tests can
 exercise them directly without stubbing the whole Discord/SDK surface.
 
 Groups:
-  - Discord text shaping: _extract_urls, _split_body_and_sources,
-    _chunk_for_discord, _safe_field_value.
+  - Discord text shaping: extract_urls, split_body_and_sources,
+    chunk_for_discord, safe_field_value.
   - Failure guards:       is_bot_apology, is_transient_llm_error,
-                           classify_llm_error.
+                          classify_llm_error.
   - Output shaping:       normalize_digits, ensure_sources_line.
+  - Tool-loop plumbing:   hash_tool_call, tool_calls_signature,
+                          is_real_tool_content, structured error markers.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 # ── Discord limits we must respect ────────────────────────────────
 DISCORD_MSG_LIMIT = 2000
@@ -178,6 +182,88 @@ def normalize_digits(text: str) -> str:
         last = m.end()
     out.append(text[last:].translate(_ASCII_TO_DEVANAGARI))
     return "".join(out)
+
+
+# ── Tool-loop plumbing ────────────────────────────────────────────
+#
+# Structured markers the bot injects into tool-result `content` when the
+# registry call itself failed. Putting these in the content (instead of
+# silently substituting a bland error string) makes the failure visible to
+# the LLM so it can decide between "retry with different args", "switch to
+# a fallback tool", or "apologize in Nepali with a partial answer". This
+# mirrors Anthropic's `is_error` convention — we just encode it inline
+# because the OpenAI/Sarvam tool message shape has no dedicated flag.
+
+TOOL_ERROR_MARKER = "[TOOL_ERROR]"
+TOOL_TIMEOUT_MARKER = "[TOOL_TIMEOUT]"
+TOOL_DEDUP_MARKER = "[TOOL_DEDUP_HIT]"
+
+_TOOL_STATUS_MARKERS: tuple[str, ...] = (
+    TOOL_ERROR_MARKER,
+    TOOL_TIMEOUT_MARKER,
+    TOOL_DEDUP_MARKER,
+)
+
+
+def hash_tool_call(name: str, args: dict[str, Any]) -> str:
+    """Return a stable signature for a tool call.
+
+    Used for in-turn dedup: if the model emits the same (name, args) pair
+    across rounds we reuse the cached result and annotate the tool message
+    so the model notices it's looping.
+    """
+    try:
+        canonical = json.dumps(args or {}, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        canonical = repr(args)
+    digest = hashlib.sha256(f"{name}|{canonical}".encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def tool_calls_signature(
+    tool_calls: Iterable[Any],
+) -> tuple[tuple[str, str], ...]:
+    """Aggregate signature for a whole round's tool_calls.
+
+    Two consecutive rounds with the same signature means the model is
+    spinning on identical calls and won't converge — bot.py uses this to
+    break the loop early and fall through to "force text answer".
+    """
+    out: list[tuple[str, str]] = []
+    for tc in tool_calls:
+        name = getattr(getattr(tc, "function", None), "name", None) or ""
+        raw = getattr(getattr(tc, "function", None), "arguments", None) or ""
+        try:
+            args = json.loads(raw) if raw else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            args = {"_raw": raw}
+        out.append((name, hash_tool_call(name, args)))
+    return tuple(sorted(out))
+
+
+def is_tool_status_marker(content: str | None) -> bool:
+    """True when the content starts with one of our structured error markers."""
+    if not content:
+        return False
+    stripped = content.lstrip()
+    return any(stripped.startswith(m) for m in _TOOL_STATUS_MARKERS)
+
+
+def is_real_tool_content(result: Any) -> bool:
+    """True iff the tool actually produced usable content.
+
+    Gates `tool_was_used` so the validator doesn't demand a `स्रोत:` line
+    when every tool call failed or was deduped — we'd just be asking the
+    model to invent a citation.
+    """
+    if result is None:
+        return False
+    if not getattr(result, "success", False):
+        return False
+    content = getattr(result, "content", None)
+    if not content or not content.strip():
+        return False
+    return not is_tool_status_marker(content)
 
 
 def ensure_sources_line(

@@ -75,6 +75,11 @@ class ToolSpec(BaseModel):
     category: ToolCategory
     parameters: list[ToolParam] = Field(default_factory=list)
     enabled: bool = True
+    # Per-tool wall-clock timeout. None → use the global default in bot.py.
+    # Slow fan-out tools (aggregators, scrapers) should set this higher than
+    # the default so a few slow endpoints don't cascade into a loop-level
+    # failure. Fast local lookups can pin it lower for faster UX.
+    timeout_seconds: float | None = None
 
     def to_openai_tool(self) -> dict[str, Any]:
         """

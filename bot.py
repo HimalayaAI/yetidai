@@ -10,11 +10,29 @@ Flow:
 Backend: Sarvam (`sarvam-30b`) via the `sarvamai` async client. Configured
 through `SARVAM_API_KEY` in the environment.
 
+Tool-loop design (mirrors Anthropic's "let the model decide" model):
+  - Parallel tool execution per round via asyncio.gather. Anthropic's SDK
+    treats parallel tool use as the default; we match that so the model
+    can fan out several OSINT calls in one round without serialising them.
+  - Per-tool timeout (ToolSpec.timeout_seconds, else YETI_TOOL_TIMEOUT).
+    A single hung endpoint cannot starve the loop any more.
+  - Structured error markers ([TOOL_ERROR], [TOOL_TIMEOUT], [TOOL_DEDUP_HIT])
+    encoded in the tool result content — the analogue of Anthropic's
+    `is_error` flag in a system that has no dedicated field for it.
+  - Cross-round dedup cache keyed by (name, args_hash): the same call made
+    twice returns the cached result wrapped in a dedup marker so the model
+    sees it's looping.
+  - Progress check: two consecutive rounds with the same tool_calls
+    signature → break and force a text round, instead of burning the
+    MAX_TOOL_ROUNDS budget.
+  - tool_was_used gates on actually-useful content, so the validator
+    doesn't demand a citation line when every tool call failed.
+
 Resilience:
   - Per-phase try/except so one failure can't masquerade as another.
   - Sarvam calls wrapped in asyncio.wait_for with one transient retry.
   - Last tool-round forces tools=None so the LLM must emit text.
-  - Deterministic fixups (ASCII→Devanagari digits, सरस्रोत line injection)
+  - Deterministic fixups (ASCII→Devanagari digits, स्रोत line injection)
     run before invoking a second LLM turn for validator nudges.
   - Error messages classified into distinct Nepali strings and tagged with
     the turn_id for log correlation.
@@ -44,15 +62,21 @@ from core.bot_helpers import (
     DISCORD_EMBED_FOOTER_LIMIT,
     DISCORD_MSG_LIMIT,
     GENERIC_TECH_ERROR,
+    TOOL_DEDUP_MARKER,
+    TOOL_ERROR_MARKER,
+    TOOL_TIMEOUT_MARKER,
     chunk_for_discord,
     classify_llm_error,
     ensure_sources_line,
     extract_urls,
+    hash_tool_call,
     is_bot_apology,
+    is_real_tool_content,
     is_transient_llm_error,
     normalize_digits,
     safe_field_value,
     split_body_and_sources,
+    tool_calls_signature,
     with_turn_id,
 )
 
@@ -94,6 +118,9 @@ registry = get_registry()
 
 # Safety cap: max tool-call round-trips before forcing a text answer.
 MAX_TOOL_ROUNDS = 5
+# Per-tool wall-clock limit. Tools can override via ToolSpec.timeout_seconds
+# (slow aggregators) or be pinned lower for fast local lookups.
+YETI_TOOL_TIMEOUT = float(os.getenv("YETI_TOOL_TIMEOUT", "15"))
 
 
 async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
@@ -120,6 +147,120 @@ async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
         await channel.send(embed=embed)
     except Exception:
         logger.exception("Failed to send citations embed (body already delivered)")
+
+
+async def _execute_tool_call(
+    tc,
+    ctx: ToolContext,
+    *,
+    dedup_cache: dict,
+    default_timeout: float,
+) -> tuple[str, dict, ToolResult, dict]:
+    """Run a single tool call with dedup + per-tool timeout + error capture.
+
+    Returns (tool_call_id, parsed_args, result, log_extra). The caller owns
+    appending the tool message and extending tool_calls_log — keeping those
+    out of this helper makes it trivial to unit-test in isolation.
+
+    Semantics:
+        * Bad JSON in arguments → args becomes {}, error_class="bad_args_json".
+          We still call the tool because plugins tolerate missing keys better
+          than they tolerate being skipped.
+        * Same (name, args_hash) seen earlier this turn → return the cached
+          ToolResult wrapped in a [TOOL_DEDUP_HIT] marker so the model sees
+          it looped. This is cross-round within one user message.
+        * Timeout → ToolResult with [TOOL_TIMEOUT] marker; the model can
+          choose to retry or switch tools.
+        * Other exceptions → ToolResult with [TOOL_ERROR] marker; content
+          deliberately short so the tool message doesn't dominate context.
+
+    Never raises. A well-formed ToolResult is always returned.
+    """
+    name = tc.function.name
+    raw_args = tc.function.arguments or ""
+    t_start = time.time()
+    error_class: str | None = None
+    dedup_hit = False
+
+    try:
+        args = json.loads(raw_args) if raw_args else {}
+    except json.JSONDecodeError:
+        logger.warning(
+            "Bad tool_call arguments JSON for %s: %r", name, raw_args,
+        )
+        args = {}
+        error_class = "bad_args_json"
+
+    sig = hash_tool_call(name, args)
+    cached: ToolResult | None = dedup_cache.get(sig)
+    if cached is not None:
+        dedup_hit = True
+        original = (cached.content or "").strip()
+        dedup_content = (
+            f"{TOOL_DEDUP_MARKER} {name} already executed earlier this turn "
+            f"with the same arguments. Reusing prior result:\n{original}"
+        )
+        result = ToolResult(
+            tool_id=cached.tool_id,
+            success=cached.success,
+            content=dedup_content,
+            raw_data=cached.raw_data,
+            meta=cached.meta,
+            trigger_fallback=False,  # suppress chained fallbacks on replay
+        )
+        error_class = error_class or "dedup"
+        logger.info("Tool call dedup hit: %s(args=%s)", name, args)
+        log_extra = {
+            "latency_ms": int((time.time() - t_start) * 1000),
+            "error_class": error_class,
+            "dedup": True,
+        }
+        return (tc.id, args, result, log_extra)
+
+    spec = registry.get_spec(name)
+    timeout_s = (
+        spec.timeout_seconds
+        if (spec is not None and spec.timeout_seconds is not None)
+        else default_timeout
+    )
+
+    try:
+        result = await asyncio.wait_for(
+            registry.execute(name, ctx, args),
+            timeout=timeout_s,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Tool %s timed out after %.1fs", name, timeout_s)
+        error_class = "timeout"
+        result = ToolResult(
+            tool_id=name,
+            success=False,
+            content=(
+                f"{TOOL_TIMEOUT_MARKER} {name} exceeded {timeout_s:.1f}s."
+                " Consider a different tool or narrower query."
+            ),
+            error="timeout",
+        )
+    except Exception as exc:  # noqa: BLE001 — we deliberately catch-all
+        logger.exception("Tool %s raised", name)
+        error_class = type(exc).__name__
+        result = ToolResult(
+            tool_id=name,
+            success=False,
+            content=(
+                f"{TOOL_ERROR_MARKER} {name} failed internally: "
+                f"{type(exc).__name__}."
+            ),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    dedup_cache[sig] = result
+    log_extra = {
+        "latency_ms": int((time.time() - t_start) * 1000),
+        "error_class": error_class,
+        "dedup": dedup_hit,
+    }
+    return (tc.id, args, result, log_extra)
 
 
 async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
@@ -240,8 +381,12 @@ async def on_message(message):
         # ── Tool-call loop ────────────────────────────────────────
         # On the final round we strip tools to force Sarvam to emit text,
         # eliminating the "ran out of rounds with empty ai_response" failure
-        # mode.
+        # mode. If the model emits the same tool_calls signature two rounds
+        # in a row we also break early — no point burning more budget on a
+        # loop that won't converge.
         response = None
+        dedup_cache: dict[str, ToolResult] = {}
+        last_round_signature: tuple | None = None
         try:
             for _round in range(MAX_TOOL_ROUNDS):
                 is_last_round = (_round == MAX_TOOL_ROUNDS - 1)
@@ -254,10 +399,37 @@ async def on_message(message):
                 if not response or not getattr(response, "choices", None):
                     break
                 choice = response.choices[0]
+                finish_reason = getattr(choice, "finish_reason", None)
 
                 tool_calls = getattr(choice.message, "tool_calls", None) or []
-                if choice.finish_reason != "tool_calls" or not tool_calls:
+                if finish_reason != "tool_calls" or not tool_calls:
+                    logger.info(
+                        "LLM stop_reason=%s (round=%d, tool_calls=%d) → breaking loop",
+                        finish_reason, _round, len(tool_calls),
+                    )
                     break
+
+                # Anthropic-style visibility: when the model narrates its plan
+                # alongside tool_calls, surface that reasoning in logs so we
+                # can audit *why* it chose those calls.
+                assistant_text = (choice.message.content or "").strip()
+                if assistant_text:
+                    logger.info(
+                        "LLM inter-round narration (round=%d): %s",
+                        _round, assistant_text[:300],
+                    )
+
+                # Progress check: identical tool_calls signature twice in a
+                # row = loop. Cut to the forced-text round.
+                this_signature = tool_calls_signature(tool_calls)
+                if this_signature == last_round_signature:
+                    logger.info(
+                        "No-progress detected at round %d (same signature) → "
+                        "breaking to force text answer.",
+                        _round,
+                    )
+                    break
+                last_round_signature = this_signature
 
                 # Append the assistant message (with tool_calls) to history
                 messages.append({
@@ -284,34 +456,37 @@ async def on_message(message):
                     user_id=message.author.id,
                 )
 
-                for tc in tool_calls:
-                    tool_was_used = True
-                    try:
-                        args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError:
-                        logger.warning(
-                            "Bad tool_call arguments JSON for %s: %r",
-                            tc.function.name, tc.function.arguments,
-                        )
-                        args = {}
+                # Parallel fan-out: run every primary tool in this round
+                # concurrently. Anthropic's tool-use loop treats parallel
+                # calls as the default; we match that so two independent
+                # OSINT lookups don't serialise on the wire.
+                exec_results = await asyncio.gather(*[
+                    _execute_tool_call(
+                        tc, ctx,
+                        dedup_cache=dedup_cache,
+                        default_timeout=YETI_TOOL_TIMEOUT,
+                    )
+                    for tc in tool_calls
+                ])
 
-                    try:
-                        result = await registry.execute(tc.function.name, ctx, args)
-                    except Exception:
-                        logger.exception(
-                            "Tool %s raised; returning error to LLM", tc.function.name,
-                        )
-                        result = ToolResult(
-                            success=False,
-                            content=f"[TOOL_ERROR] {tc.function.name} failed internally.",
-                        )
-
-                    messages.append(result.to_tool_message(tc.id))
-                    tool_calls_log.append({
-                        "name": tc.function.name,
+                # Materialise round results in original tool_calls order so
+                # the tool_call_id → tool_message pairing stays correct, then
+                # chain any auto-fallbacks sequentially (they depend on the
+                # primary's trigger flag).
+                for (tc_id, args, result, log_extra) in exec_results:
+                    messages.append(result.to_tool_message(tc_id))
+                    log_entry = {
+                        "name": next(
+                            (t.function.name for t in tool_calls if t.id == tc_id),
+                            tc_id,
+                        ),
                         "args": args,
                         "success": result.success,
-                    })
+                        **log_extra,
+                    }
+                    tool_calls_log.append(log_entry)
+                    if is_real_tool_content(result):
+                        tool_was_used = True
                     citation_urls.extend(extract_urls(result.content))
 
                     if result.meta:
@@ -331,13 +506,15 @@ async def on_message(message):
                         }
 
                     logger.info(
-                        "Tool call: %s(args=%s) → success=%s",
-                        tc.function.name, args, result.success,
+                        "Tool call: %s(args=%s) → success=%s latency=%dms class=%s",
+                        log_entry["name"], args, result.success,
+                        log_extra["latency_ms"], log_extra["error_class"],
                     )
 
                     # Auto-fallback: execute a second tool call in the same
                     # turn when the primary tool asked for it (e.g. OSINT
                     # returned no match → fall back to internet_search).
+                    # Dedup replays suppress this via trigger_fallback=False.
                     if result.trigger_fallback and result.fallback_tool:
                         fallback_call_id = f"autofb_{uuid.uuid4().hex[:8]}"
                         fb_args = result.fallback_args or {}
@@ -355,35 +532,41 @@ async def on_message(message):
                                 },
                             }],
                         })
-                        try:
-                            fb_result = await registry.execute(
-                                result.fallback_tool, ctx, fb_args,
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Auto-fallback tool %s raised",
-                                result.fallback_tool,
-                            )
-                            fb_result = ToolResult(
-                                success=False,
-                                content=(
-                                    f"[TOOL_ERROR] {result.fallback_tool} "
-                                    "failed internally."
-                                ),
-                            )
+                        fb_tc = type(
+                            "FallbackTC", (), {
+                                "id": fallback_call_id,
+                                "function": type(
+                                    "F", (), {
+                                        "name": result.fallback_tool,
+                                        "arguments": json.dumps(
+                                            fb_args, ensure_ascii=False,
+                                        ),
+                                    },
+                                )(),
+                            },
+                        )()
+                        _, _, fb_result, fb_log_extra = await _execute_tool_call(
+                            fb_tc, ctx,
+                            dedup_cache=dedup_cache,
+                            default_timeout=YETI_TOOL_TIMEOUT,
+                        )
                         messages.append(fb_result.to_tool_message(fallback_call_id))
                         tool_calls_log.append({
                             "name": result.fallback_tool,
                             "args": fb_args,
                             "success": fb_result.success,
-                            "auto_fallback_from": tc.function.name,
+                            "auto_fallback_from": log_entry["name"],
+                            **fb_log_extra,
                         })
+                        if is_real_tool_content(fb_result):
+                            tool_was_used = True
                         citation_urls.extend(extract_urls(fb_result.content))
                         fallback_used = True
                         logger.info(
-                            "Auto-fallback %s → %s(args=%s) success=%s",
-                            tc.function.name, result.fallback_tool,
+                            "Auto-fallback %s → %s(args=%s) success=%s latency=%dms",
+                            log_entry["name"], result.fallback_tool,
                             fb_args, fb_result.success,
+                            fb_log_extra["latency_ms"],
                         )
 
             # Extract final answer
