@@ -9,23 +9,52 @@ Flow:
 
 Backend: Sarvam (`sarvam-30b`) via the `sarvamai` async client. Configured
 through `SARVAM_API_KEY` in the environment.
+
+Resilience:
+  - Per-phase try/except so one failure can't masquerade as another.
+  - Sarvam calls wrapped in asyncio.wait_for with one transient retry.
+  - Last tool-round forces tools=None so the LLM must emit text.
+  - Deterministic fixups (ASCII→Devanagari digits, सरस्रोत line injection)
+    run before invoking a second LLM turn for validator nudges.
+  - Error messages classified into distinct Nepali strings and tagged with
+    the turn_id for log correlation.
 """
-import discord
+import asyncio
+import datetime
 import json
 import logging
 import os
+import random
 import re
 import time
 import uuid
+
+import discord
 from dotenv import load_dotenv
 from sarvamai import AsyncSarvamAI
+
 from functionality import functional
 
 # ── Core framework ────────────────────────────────────────────────
 from core.tool_registry import get_registry
-from core.tool_contracts import ToolContext
+from core.tool_contracts import ToolContext, ToolResult
 from core.output_validator import validate_answer, build_fix_message
 from core.request_log import log_turn
+from core.bot_helpers import (
+    DISCORD_EMBED_FOOTER_LIMIT,
+    DISCORD_MSG_LIMIT,
+    GENERIC_TECH_ERROR,
+    chunk_for_discord,
+    classify_llm_error,
+    ensure_sources_line,
+    extract_urls,
+    is_bot_apology,
+    is_transient_llm_error,
+    normalize_digits,
+    safe_field_value,
+    split_body_and_sources,
+    with_turn_id,
+)
 
 # ── Register plugins ──────────────────────────────────────────────
 import tools.osint.plugin as osint_plugin
@@ -45,8 +74,12 @@ SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
 llm_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
 LLM_MODEL = os.getenv("SARVAM_ROUTER_MODEL", "sarvam-30b")
+SARVAM_TIMEOUT_SECONDS = float(os.getenv("SARVAM_TIMEOUT_SECONDS", "25"))
 YETI_BACKEND = "sarvam"
-logger.info("Using Sarvam backend (model=%s).", LLM_MODEL)
+logger.info(
+    "Using Sarvam backend (model=%s, timeout=%.1fs).",
+    LLM_MODEL, SARVAM_TIMEOUT_SECONDS,
+)
 
 with open("systemPrompt.txt", "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
@@ -59,102 +92,20 @@ chad = functional(bot=bot)
 
 registry = get_registry()
 
-# Safety cap: max tool-call round-trips before forcing a text answer
+# Safety cap: max tool-call round-trips before forcing a text answer.
 MAX_TOOL_ROUNDS = 5
-
-# Discord hard limits we need to respect when sending content.
-_DISCORD_MSG_LIMIT = 2000
-_DISCORD_EMBED_FIELD_VALUE_LIMIT = 1024
-_DISCORD_EMBED_FOOTER_LIMIT = 2048
-
-_URL_RE = re.compile(r"https?://[^\s)\]\"<>]+")
-
-# Generic-apology strings the bot itself emits on failure. We never want
-# these replayed back to Sarvam as assistant history — otherwise Sarvam
-# learns to parrot the apology on healthy turns.
-_BOT_APOLOGY_PREFIXES = (
-    "माफ गर्नुहोस्, एउटा प्राविधिक समस्या",
-    "माफ गर्नुहोस्, उत्तर तयार गर्न सकिएन",
-)
-_GENERIC_TECH_ERROR = (
-    "माफ गर्नुहोस्, एउटा प्राविधिक समस्या देखियो। कृपया फेरि प्रयास गर्नुहोस्।"
-)
-
-
-def _is_bot_apology(content: str) -> bool:
-    """True if a message looks like one of our own generic failure messages."""
-    if not content:
-        return False
-    stripped = content.lstrip()
-    return any(stripped.startswith(p) for p in _BOT_APOLOGY_PREFIXES)
-
-
-def _extract_urls(text: str | None) -> list[str]:
-    """Pull http(s) URLs out of tool output for citation embeds."""
-    if not text:
-        return []
-    seen: set[str] = set()
-    out: list[str] = []
-    for url in _URL_RE.findall(text):
-        url = url.rstrip(".,;:")
-        if url not in seen:
-            seen.add(url)
-            out.append(url)
-    return out
-
-
-def _split_body_and_sources(answer: str) -> tuple[str, str]:
-    """Separate the main Nepali body from the trailing `स्रोत:` citation line."""
-    idx = answer.rfind("स्रोत:")
-    if idx < 0:
-        return answer, ""
-    return answer[:idx].rstrip(), answer[idx:].strip()
-
-
-def _chunk_for_discord(text: str, limit: int = _DISCORD_MSG_LIMIT) -> list[str]:
-    """Break text into Discord-sized chunks at a newline or whitespace boundary.
-
-    Prefers the last newline inside the window, then the last whitespace; only
-    falls back to a hard slice when no boundary exists in the window (e.g. an
-    unbroken URL or single long token).
-    """
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
-        cut = window.rfind("\n")
-        if cut < limit // 2:
-            ws = window.rfind(" ")
-            if ws > cut:
-                cut = ws
-        if cut <= 0:
-            cut = limit
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-def _safe_field_value(url: str) -> str:
-    """Fit a URL into Discord's 1024-char embed field value limit."""
-    if len(url) <= _DISCORD_EMBED_FIELD_VALUE_LIMIT:
-        return url
-    # Truncate with an ellipsis marker so users see the link was clipped.
-    return url[: _DISCORD_EMBED_FIELD_VALUE_LIMIT - 1] + "…"
 
 
 async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
     """Send answer; attach a citations embed when we have URLs.
 
     Body chunks and the citations embed are sent independently: a failure to
-    build or send the embed must not prevent the body from being delivered,
-    and vice versa.
+    build or send the embed must not prevent the body from being delivered.
     """
-    body, sources_line = _split_body_and_sources(answer)
+    body, sources_line = split_body_and_sources(answer)
     text = body if (citation_urls and body) else answer
 
-    for chunk in _chunk_for_discord(text, _DISCORD_MSG_LIMIT):
+    for chunk in chunk_for_discord(text, DISCORD_MSG_LIMIT):
         await channel.send(chunk)
 
     if not citation_urls:
@@ -163,13 +114,46 @@ async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
     try:
         embed = discord.Embed(title="स्रोत / Sources", color=0x2D72D2)
         for idx, url in enumerate(citation_urls[:5], start=1):
-            embed.add_field(name=f"{idx}.", value=_safe_field_value(url), inline=False)
+            embed.add_field(name=f"{idx}.", value=safe_field_value(url), inline=False)
         if sources_line:
-            embed.set_footer(text=sources_line[:_DISCORD_EMBED_FOOTER_LIMIT])
+            embed.set_footer(text=sources_line[:DISCORD_EMBED_FOOTER_LIMIT])
         await channel.send(embed=embed)
     except Exception:
-        # Never let a bad citation embed clobber the answer the user already got.
         logger.exception("Failed to send citations embed (body already delivered)")
+
+
+async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
+    """One Sarvam round-trip with timeout and one transient retry.
+
+    Raises the last exception if both attempts fail. Non-transient errors
+    (auth, schema, ...) raise on the first attempt with no retry.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(2):
+        try:
+            return await asyncio.wait_for(
+                llm_client.chat.completions(
+                    model=LLM_MODEL,
+                    messages=messages,
+                    tools=tools_array if tools_array else None,
+                    tool_choice=tool_choice if tools_array else None,
+                ),
+                timeout=SARVAM_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            logger.warning("Sarvam timeout (attempt %d/2)", attempt + 1)
+        except Exception as exc:
+            if not is_transient_llm_error(exc):
+                raise
+            last_exc = exc
+            logger.warning(
+                "Sarvam transient error (attempt %d/2): %s", attempt + 1, exc,
+            )
+        if attempt == 0:
+            await asyncio.sleep(0.5 + random.random() * 0.5)
+    assert last_exc is not None
+    raise last_exc
 
 
 @bot.event
@@ -177,16 +161,6 @@ async def on_ready():
     tool_names = [t.name for t in registry.list_tools()]
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
     logger.info("Registered tools: %s", tool_names)
-
-
-async def _run_llm_turn(messages, tools_array):
-    """One Sarvam round-trip. Raised exceptions propagate to the caller."""
-    return await llm_client.chat.completions(
-        model=LLM_MODEL,
-        messages=messages,
-        tools=tools_array if tools_array else None,
-        tool_choice="auto" if tools_array else None,
-    )
 
 
 @bot.event
@@ -211,17 +185,14 @@ async def on_message(message):
         validator_retries = 0
         ai_response = ""
         citation_urls: list[str] = []
-        llm_failed = False
+        llm_exc: BaseException | None = None
 
         # ── Build message list ────────────────────────────────────
-        # No LLM traffic yet — these failures are local and trivial, but if
-        # they raise we fall back to the generic error (see outermost guard).
         try:
             previous_messages = await chad.get_message_history(
                 message.channel, limit=5,
             )
 
-            import datetime
             today_str = datetime.date.today().strftime("%Y-%m-%d")
             dynamic_system_prompt = (
                 f"{SYSTEM_PROMPT}\n\n# CURRENT DATE:\nToday's Date is: {today_str}"
@@ -232,9 +203,7 @@ async def on_message(message):
                 if prev_msg.id == message.id or not prev_msg.content.strip():
                     continue
                 if prev_msg.author == bot.user:
-                    # Skip our own prior apologies so Sarvam doesn't learn to
-                    # parrot them. Anything else we sent is fair context.
-                    if _is_bot_apology(prev_msg.content):
+                    if is_bot_apology(prev_msg.content):
                         continue
                     messages.append({
                         "role": "assistant",
@@ -250,7 +219,7 @@ async def on_message(message):
             tools_array = registry.openai_tools()
         except Exception:
             logger.exception("Failed building request context")
-            await message.channel.send(_GENERIC_TECH_ERROR)
+            await message.channel.send(with_turn_id(GENERIC_TECH_ERROR, turn_id))
             log_turn(
                 turn_id=turn_id,
                 user_id=getattr(message.author, "id", None),
@@ -269,13 +238,18 @@ async def on_message(message):
             return
 
         # ── Tool-call loop ────────────────────────────────────────
-        # The LLM decides whether to call tools via tool_choice="auto".
-        # If it returns tool_calls, we execute them and loop. If it returns
-        # a text answer, we break.
+        # On the final round we strip tools to force Sarvam to emit text,
+        # eliminating the "ran out of rounds with empty ai_response" failure
+        # mode.
         response = None
         try:
             for _round in range(MAX_TOOL_ROUNDS):
-                response = await _run_llm_turn(messages, tools_array)
+                is_last_round = (_round == MAX_TOOL_ROUNDS - 1)
+                response = await _run_llm_turn(
+                    messages,
+                    tools_array if (tools_array and not is_last_round) else None,
+                    tool_choice=("auto" if (tools_array and not is_last_round) else None),
+                )
 
                 if not response or not getattr(response, "choices", None):
                     break
@@ -324,13 +298,9 @@ async def on_message(message):
                     try:
                         result = await registry.execute(tc.function.name, ctx, args)
                     except Exception:
-                        # A single tool failing shouldn't poison the whole turn —
-                        # feed an error result back so the LLM can recover or
-                        # choose a different tool on the next round.
                         logger.exception(
                             "Tool %s raised; returning error to LLM", tc.function.name,
                         )
-                        from core.tool_contracts import ToolResult
                         result = ToolResult(
                             success=False,
                             content=f"[TOOL_ERROR] {tc.function.name} failed internally.",
@@ -342,7 +312,7 @@ async def on_message(message):
                         "args": args,
                         "success": result.success,
                     })
-                    citation_urls.extend(_extract_urls(result.content))
+                    citation_urls.extend(extract_urls(result.content))
 
                     if result.meta:
                         osint_endpoints_ok = result.meta.get(
@@ -379,7 +349,9 @@ async def on_message(message):
                                 "type": "function",
                                 "function": {
                                     "name": result.fallback_tool,
-                                    "arguments": json.dumps(fb_args, ensure_ascii=False),
+                                    "arguments": json.dumps(
+                                        fb_args, ensure_ascii=False,
+                                    ),
                                 },
                             }],
                         })
@@ -389,12 +361,15 @@ async def on_message(message):
                             )
                         except Exception:
                             logger.exception(
-                                "Auto-fallback tool %s raised", result.fallback_tool,
+                                "Auto-fallback tool %s raised",
+                                result.fallback_tool,
                             )
-                            from core.tool_contracts import ToolResult
                             fb_result = ToolResult(
                                 success=False,
-                                content=f"[TOOL_ERROR] {result.fallback_tool} failed internally.",
+                                content=(
+                                    f"[TOOL_ERROR] {result.fallback_tool} "
+                                    "failed internally."
+                                ),
                             )
                         messages.append(fb_result.to_tool_message(fallback_call_id))
                         tool_calls_log.append({
@@ -403,7 +378,7 @@ async def on_message(message):
                             "success": fb_result.success,
                             "auto_fallback_from": tc.function.name,
                         })
-                        citation_urls.extend(_extract_urls(fb_result.content))
+                        citation_urls.extend(extract_urls(fb_result.content))
                         fallback_used = True
                         logger.info(
                             "Auto-fallback %s → %s(args=%s) success=%s",
@@ -414,46 +389,59 @@ async def on_message(message):
             # Extract final answer
             if response and getattr(response, "choices", None):
                 ai_response = response.choices[0].message.content or ""
-        except Exception:
+        except Exception as exc:
             logger.exception("Sarvam call / tool loop failed")
-            llm_failed = True
+            llm_exc = exc
 
-        # ── Validator + one-shot retry (never fatal) ──────────────
-        if ai_response and not llm_failed:
+        # ── Deterministic fixups + validator retry (non-fatal) ────
+        if ai_response and llm_exc is None:
+            # Mechanical fixes first — cheap, don't need the LLM.
+            ai_response = normalize_digits(ai_response)
+            if tool_was_used:
+                ai_response = ensure_sources_line(ai_response, citation_urls)
+
             try:
                 issues = validate_answer(ai_response, tool_was_used=tool_was_used)
                 if issues:
-                    logger.info("Validator issues: %s — retrying once.", issues)
+                    logger.info(
+                        "Validator issues after deterministic fixes: %s — retrying once.",
+                        issues,
+                    )
                     messages.append({"role": "assistant", "content": ai_response})
                     messages.append({
                         "role": "system",
                         "content": build_fix_message(issues),
                     })
-                    retry_resp = await llm_client.chat.completions(
-                        model=LLM_MODEL,
-                        messages=messages,
-                        tools=None,
-                        tool_choice=None,
+                    retry_resp = await _run_llm_turn(
+                        messages, tools_array=None, tool_choice=None,
                     )
                     retry_content = (
                         retry_resp.choices[0].message.content or ""
                     ) if retry_resp and getattr(retry_resp, "choices", None) else ""
                     if retry_content:
+                        # Apply the same deterministic fixes to the retry output.
+                        retry_content = normalize_digits(retry_content)
+                        if tool_was_used:
+                            retry_content = ensure_sources_line(
+                                retry_content, citation_urls,
+                            )
                         ai_response = retry_content
                         validator_retries = 1
             except Exception:
-                # Retry failing is not a user-visible error: we already have
-                # a valid-enough answer in ai_response.
                 logger.exception("Validator retry failed; keeping original answer")
 
         # ── Send to Discord ──────────────────────────────────────
         try:
             if ai_response:
                 await _send_discord(message.channel, ai_response, citation_urls)
-            elif llm_failed:
-                await message.channel.send(_GENERIC_TECH_ERROR)
+            elif llm_exc is not None:
+                await message.channel.send(
+                    with_turn_id(classify_llm_error(llm_exc), turn_id),
+                )
             else:
-                await message.channel.send("माफ गर्नुहोस्, उत्तर तयार गर्न सकिएन।")
+                await message.channel.send(
+                    with_turn_id("माफ गर्नुहोस्, उत्तर तयार गर्न सकिएन।", turn_id),
+                )
         except Exception:
             logger.exception("Discord send failed")
 
