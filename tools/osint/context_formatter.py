@@ -232,10 +232,11 @@ def build_context_brief(bundle: dict[str, Any], max_chars: int = 1800) -> str | 
                     sources.append(item["source_name"])
 
     if not blocks and errors:
-        # Signal data-fetch failure as a structured marker; the bot layer
-        # maps this to the appropriate Nepali user-facing error. Instructions
-        # for HOW to answer live in systemPrompt.txt, not in tool output.
-        return "[NEPALOSINT_FETCH_FAILED] No live context available for this query."
+        lines = [
+            "NepalOSINT को live context अहिले ल्याउन सकिएन।",
+            "हालको सार्वजनिक तथ्य चाहिएको हो भने उत्तरमा यो सीमाबारे स्पष्ट भन्नुहोस्।",
+        ]
+        return "\n".join(lines)
 
     if not blocks:
         return None
@@ -245,21 +246,15 @@ def build_context_brief(bundle: dict[str, Any], max_chars: int = 1800) -> str | 
         if source and source not in deduped_sources:
             deduped_sources.append(source)
 
-    source_line = (
-        ", ".join(deduped_sources[:4])
-        if deduped_sources
-        else "NepalOSINT live context"
-    )
-    sources_footer = f"SOURCES: {source_line}"
+    source_line = ", ".join(deduped_sources[:4]) if deduped_sources else "NepalOSINT live context"
+    footer = [
+        "उत्तर दिने नियम:",
+        "- माथिको सन्दर्भ प्रयोग भएको छ भने नेपालीमै छोटो र स्पष्ट उत्तर दिनुहोस्।",
+        "- उत्तरको अन्त्यमा अनिवार्य रूपमा `स्रोत:` शीर्षक राखेर २ देखि ४ स्रोत उल्लेख गर्नुहोस्।",
+        f"- प्राथमिक स्रोतहरू: {source_line}",
+    ]
+    if plan and getattr(plan, "wants_history", False):
+        footer.append("- इतिहाससम्बन्धी प्रश्नमा समयसीमा स्पष्ट गरेर उत्तर दिनुहोस्।")
 
-    footer_blocks = [sources_footer]
-    if errors:
-        failed = ", ".join(sorted(errors.keys()))
-        footer_blocks.insert(
-            0,
-            f"(PARTIAL_CONTEXT: {len(errors)} endpoint(s) failed — {failed}. "
-            f"Answer using the blocks above; say 'आंशिक तथ्याङ्क' if key data is missing.)",
-        )
-
-    combined = "\n\n".join(blocks + footer_blocks)
+    combined = "\n\n".join(blocks + ["\n".join(footer)])
     return combined[:max_chars].rstrip()

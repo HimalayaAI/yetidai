@@ -1,11 +1,7 @@
 discord.py
 python-dotenv
+sarvamai
 httpx
 pydantic
 beautifulsoup4
 requests
-
-# Optional: only needed when YETI_BACKEND=sarvam. Default backend is local
-# Haiku via the `claude` CLI (requires the Claude Code CLI to be installed
-# and authenticated — `claude login` once).
-sarvamai
