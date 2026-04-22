@@ -16,43 +16,14 @@ from core.tool_registry import get_registry
 SEARCH_SPEC = ToolSpec(
     tool_id="search.internet",
     name="internet_search",
-    description=(
-        "FALLBACK tool — general-purpose DuckDuckGo web search. Use this ONLY "
-        "when the question is clearly NOT about Nepal, OR when "
-        "get_nepal_live_context already ran and returned no useful data.\n\n"
-        "USE FOR:\n"
-        "  • Non-Nepal people (foreign heads of state, global CEOs, "
-        "international celebrities, historical figures).\n"
-        "  • World facts & trivia (capitals, sports results, scientific "
-        "constants, book/movie info).\n"
-        "  • Recent non-Nepal events or products.\n\n"
-        "DO NOT USE FOR (use get_nepal_live_context instead):\n"
-        "  • Nepal ministers, PM, officials — NepalOSINT tracks them live.\n"
-        "  • Nepal macro data (inflation, remittance, reserves, trade).\n"
-        "  • NEPSE, stocks, IPOs, dividends.\n"
-        "  • Public debt, parliament bills, government decisions.\n"
-        "  • Nepal news (current or historical).\n\n"
-        "OUTPUT: up to 5 English snippets with source URLs. You MUST "
-        "summarize / translate these into Nepali before replying to the user. "
-        "Never paste raw English into the final answer."
-    ),
+    description="CRITICAL: Use this tool FIRST if the user asks 'who is', names of current politicians, ministers, or general internet facts. Do NOT use NepalOSINT for current cabinet ministers.",
     category=ToolCategory.UTILITY,
     parameters=[
         ToolParam(
             name="query",
             type="string",
-            description=(
-                "Concise English search query (DDG works best in English). "
-                "Include the current year when asking about current people or "
-                "events (e.g. '… 2026'). Quote multi-word names for precision."
-            ),
+            description="The search query to look up on the internet. Keep it concise.",
             required=True,
-            examples=[
-                "UEFA Champions League 2025 winner",
-                "current president of India 2026",
-                "Mount Everest height meters",
-                "OpenAI GPT release 2026",
-            ],
         )
     ],
 )

@@ -36,7 +36,6 @@ class ToolParam(BaseModel):
     description: str = ""
     required: bool = True
     enum: list[str] | None = None   # constrained values
-    examples: list[str] | None = None  # illustrative values (shown to LLM)
 
 
 class ToolSpec(BaseModel):
@@ -93,8 +92,6 @@ class ToolSpec(BaseModel):
             }
             if p.enum is not None:
                 prop["enum"] = p.enum
-            if p.examples is not None:
-                prop["examples"] = p.examples
             properties[p.name] = prop
             if p.required:
                 required.append(p.name)
@@ -124,14 +121,6 @@ class ToolResult(BaseModel):
     content: str | None = None          # formatted text for the LLM
     raw_data: dict[str, Any] | None = None
     error: str | None = None
-    # When True, bot.py should automatically execute the named fallback tool
-    # with `fallback_args` as an extra tool call in the same turn, without
-    # asking the LLM. Used for "OSINT returned nothing useful → try web".
-    trigger_fallback: bool = False
-    fallback_tool: str | None = None
-    fallback_args: dict[str, Any] | None = None
-    # Structured metadata for logging (endpoints hit, partial flags, etc.)
-    meta: dict[str, Any] | None = None
 
     def to_tool_message(self, tool_call_id: str) -> dict[str, str]:
         """
