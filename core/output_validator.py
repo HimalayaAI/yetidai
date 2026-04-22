@@ -1,8 +1,8 @@
 """
 core/output_validator.py — deterministic checks on Yeti's final answer.
 
-Runs AFTER Sarvam emits the final Nepali reply. Flags violations cheaply so
-bot.py can ask Sarvam to fix them in one targeted retry.
+Runs AFTER the LLM emits the final Nepali reply. Flags violations cheaply
+so bot.py can ask Sarvam to fix them in one targeted retry.
 
 Checks:
   1. Devanagari-digit-only in body (ASCII digits [0-9] forbidden).
@@ -27,7 +27,7 @@ _LOANWORD_WHITELIST = {
     # Orgs / tickers (keep short — this is a safety valve, not a dictionary).
     "NEPSE", "NRB", "PDMO", "IMF", "ADB", "UEFA", "FIFA", "NBA", "GDP",
     "CPI", "USD", "NPR", "INR", "EUR", "OPEC", "OECD", "HARL", "Yeti",
-    "YetiDai", "HimalayaAI", "HimalayaGPT", "OAuth", "Haiku", "Sarvam",
+    "YetiDai", "HimalayaAI", "HimalayaGPT", "OAuth", "Sarvam",
     # Units
     "kg", "km", "mm", "cm", "ml", "MW", "GW", "KW", "pc", "ppm", "bn",
     "mn", "pct",
