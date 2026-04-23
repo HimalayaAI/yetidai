@@ -964,6 +964,32 @@ async def on_message(message):
             logger.exception("Sarvam call / tool loop failed")
             llm_exc = exc
 
+        # ── Unconditional empty-promise safety net ───────────────
+        # The in-loop safety net above only fires inside `if needs_retry`.
+        # If the retry path is short-circuited for any reason (Sarvam
+        # rejecting tool_choice="required" on both passes, an exception
+        # bubbling through both LLM calls, tools_array being empty on a
+        # weird turn, etc.), an empty promise like "म यसलाई खोज्छु।"
+        # would ship straight to Discord. This unconditional pass
+        # catches that final case — if the answer is still just a
+        # promise and the user clearly asked for data, replace it with
+        # an honest apology rather than the bare promise.
+        if (
+            ai_response
+            and is_empty_promise(ai_response, tool_was_used=tool_was_used)
+            and needs_tool_use(chad.user_input)
+        ):
+            logger.warning(
+                "Empty promise reached post-loop unconditionally (turn=%s): %r — "
+                "replacing with apology.",
+                turn_id, ai_response[:120],
+            )
+            ai_response = (
+                "माफ गर्नुहोस् हजुर — अहिले यो प्रश्नको लागि live data "
+                "ल्याउन सकिएन। केही सेकेन्डपछि पुनः सोध्नुहोस्, वा अलि "
+                "विस्तृत प्रश्न दिनुहोस्।"
+            )
+
         # ── Anti-hallucination: fabricated filenames ─────────────
         #
         # When analyze_github_repo / fetch_url / internet_search returned

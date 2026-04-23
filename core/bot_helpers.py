@@ -583,19 +583,68 @@ def news_answer_off_topic(
     return not looks_like_news_answer(answer)
 
 
+def _suggest_tool_for(user_text: str) -> str:
+    """Return a concrete tool+args hint based on lightweight routing of the
+    user's message. Used inside build_force_tool_nudge to make the retry's
+    nudge directive rather than generic — Sarvam ignores generic "call any
+    tool" hints more often than it ignores "call X with these args".
+    """
+    if not user_text:
+        return ""
+    t = user_text.lower()
+    # Nepal PM identity
+    if re.search(r"\b(pradhan\s?mantri|pradanmantri|प्रधानमन्त्री|\bpm\b)\b.*(ko ho|को हो|को हुन)",
+                 t):
+        return ('get_nepal_live_context(intent="who_is", focus="prime_minister")')
+    if re.search(r"\b(home\s?minister|ग्रहमन्त्री|गृहमन्त्री|\bhm\b)\b", t):
+        return ('get_nepal_live_context(intent="who_is", focus="home_minister")')
+    if re.search(r"\b(finance\s?minister|अर्थमन्त्री|\bfm\b)\b", t):
+        return ('get_nepal_live_context(intent="who_is", focus="finance_minister")')
+    # News
+    if re.search(r"\b(samachar|khabar|news|समाचार|खबर)\b", t):
+        return ('get_nepal_live_context(intent="general_news")')
+    # Inflation / macro
+    if re.search(r"(inflation|मुद्रास्फीति|remittance|रेमिट्यान्स|reserves|रिजर्भ)",
+                 t):
+        return ('get_nepal_live_context(intent="macro")')
+    # NEPSE / trading
+    if re.search(r"(nepse|ipo|dividend|share\s?price)", t):
+        return ('get_nepal_live_context(intent="trading")')
+    # Parliament
+    if re.search(r"(parliament|संसद|विधेयक|बिल)", t):
+        return ('get_nepal_live_context(intent="parliament")')
+    # GitHub
+    if re.search(r"github\.com|\brepo\b|\brepos\b", t):
+        return ("analyze_github_repo वा list_github_repos")
+    # URL
+    if re.search(r"https?://", t):
+        return ("fetch_url(url=<पेस्ट गरिएको URL>)")
+    return ""
+
+
 def build_force_tool_nudge(user_text: str) -> str:
     """System message used to retry after an empty-promise answer.
 
     Kept short so it doesn't push the already-long system prompt off the
     attention window. The model sees this AFTER its promise text, so it
     effectively reads: "I said I'd fetch. System reminder: actually fetch."
+    A concrete tool-and-args hint is appended when we can route the
+    message ourselves — generic "call any tool" nudges get ignored more
+    often than directive "call X(args=...)" ones.
     """
+    hint = _suggest_tool_for(user_text)
+    hint_line = (
+        f" यो प्रश्नको लागि सही tool: **{hint}**। यही call emit गर्नुहोस्।"
+        if hint else ""
+    )
     return (
-        "तपाईंले अघिल्लो turn मा कुनै tool call emit नगरी 'म बताउँछु' जस्तो "
-        "वाचा मात्र लेख्नुभयो। यो bug हो — प्रयोगकर्ताले actual data माग्दै "
-        "हुनुहुन्छ। अहिले नै उपयुक्त tool call emit गर्नुहोस् "
-        "(get_nepal_live_context / internet_search / fetch_url / "
-        "analyze_github_repo मध्ये एक)। वाचा नगरी सिधै tool call दिनुहोस्।"
+        "तपाईंले अघिल्लो turn मा कुनै tool call emit नगरी 'म बताउँछु' "
+        "/ 'म खोज्छु' जस्तो वाचा मात्र लेख्नुभयो। यो bug हो — प्रयोगकर्ताले "
+        "actual data माग्दै हुनुहुन्छ। अहिले नै उपयुक्त tool call emit "
+        "गर्नुहोस् (get_nepal_live_context / internet_search / fetch_url / "
+        "analyze_github_repo मध्ये एक)।"
+        f"{hint_line}"
+        " वाचा नगरी सिधै tool call दिनुहोस्।"
     )
 
 
