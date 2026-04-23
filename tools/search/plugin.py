@@ -54,6 +54,18 @@ _UA = (
     "(KHTML, like Gecko) Version/17.1 Safari/605.1.15"
 )
 
+# Hosts that proved to pollute "Nepal news" SERPs with Hindi / Indian
+# political content. When the query looks Nepal-scoped we drop matches
+# on these hosts so they never reach the user as "today's Nepal news".
+_NON_NEPAL_NEWS_HOSTS: frozenset[str] = frozenset({
+    "aajtak.in", "indiatv.in", "amarujala.com", "news18.com",
+    "navbharattimes.indiatimes.com", "jagran.com", "bhaskar.com",
+    "hindustantimes.com", "ndtv.com", "zeenews.india.com",
+    "timesofindia.indiatimes.com", "news24online.com",
+    # Astrology / panchang pollution — unrelated to news
+    "hamropatro.com",
+})
+
 # HTML elements that never contain useful page content. Dropped before
 # text extraction so nav/cookie banners don't eat the char budget.
 _NOISE_SELECTORS = (
@@ -152,6 +164,52 @@ def _clean_ddg_href(raw: str) -> str:
     return raw
 
 
+def _is_nepal_scoped_query(query: str) -> bool:
+    """True when the query explicitly scopes the search to Nepal.
+
+    Used to decide whether to apply the Indian-news host deny-list —
+    we only drop those hosts when the user (or the OSINT fallback)
+    said "Nepal". For a global search like "UEFA 2025 winner" we
+    don't want to filter any hosts.
+    """
+    if not query:
+        return False
+    q = query.lower()
+    return "nepal" in q or "नेपाल" in query
+
+
+def _host_from_url(url: str) -> str | None:
+    """Lowercase hostname without leading www. — used for host filters."""
+    import urllib.parse as _up
+    try:
+        host = (_up.urlparse(url).hostname or "").lower()
+    except Exception:
+        return None
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
+def _apply_nepal_filter(results: list[dict[str, str]], query: str) -> list[dict[str, str]]:
+    """Drop known non-Nepal-news hosts when the query is Nepal-scoped."""
+    if not _is_nepal_scoped_query(query):
+        return results
+    kept: list[dict[str, str]] = []
+    dropped: list[str] = []
+    for r in results:
+        host = _host_from_url(r.get("href", ""))
+        if host and host in _NON_NEPAL_NEWS_HOSTS:
+            dropped.append(host)
+            continue
+        kept.append(r)
+    if dropped:
+        logger.info(
+            "Dropped %d non-Nepal hosts from Nepal-scoped query %r: %s",
+            len(dropped), query, sorted(set(dropped)),
+        )
+    return kept
+
+
 async def _ddg_search(client: httpx.AsyncClient, query: str) -> list[dict[str, str]]:
     """Return up to MAX_RESULTS DDG results as dicts {title, snippet, href}."""
     url = "https://html.duckduckgo.com/html/"
@@ -178,9 +236,9 @@ async def _ddg_search(client: httpx.AsyncClient, query: str) -> list[dict[str, s
             "snippet": snippet_node.get_text(" ", strip=True) if snippet_node else "",
             "href": href,
         })
-        if len(out) >= MAX_RESULTS:
+        if len(out) >= MAX_RESULTS + 5:  # extra headroom for filtering
             break
-    return out
+    return _apply_nepal_filter(out, query)[:MAX_RESULTS]
 
 
 # ── Page extraction ───────────────────────────────────────────────

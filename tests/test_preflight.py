@@ -73,17 +73,34 @@ class MacroPreflightTests(unittest.TestCase):
         self.assertEqual(plan[1]["intent"], "macro")
 
 
-class TradingPreflightTests(unittest.TestCase):
-    def test_ticker(self) -> None:
-        plan = plan_preflight("RURU ko price k cha")
-        self.assertEqual(plan[0], "get_nepal_live_context")
-        self.assertEqual(plan[1]["intent"], "trading")
-        self.assertEqual(plan[1]["focus"], "RURU")
+class TradingPreflightIsSkippedTests(unittest.TestCase):
+    """Ticker / trading queries are intentionally NOT preflighted.
 
-    def test_nepse(self) -> None:
-        plan = plan_preflight("NEPSE aja kasto?")
-        self.assertEqual(plan[0], "get_nepal_live_context")
-        self.assertEqual(plan[1]["intent"], "trading")
+    OSINT's trading endpoints return news mentions of a ticker, not
+    rich company background. Sarvam's own internet_search call against
+    ruruhydro.com / icranepal.com / doed.gov.np gives the user better
+    project details — capacity, developer, COD — so we let Sarvam pick.
+    """
+
+    def test_ticker_falls_through_to_sarvam(self) -> None:
+        self.assertIsNone(plan_preflight("RURU hydropower share ko barima information"))
+
+    def test_nepse_alone_falls_through(self) -> None:
+        self.assertIsNone(plan_preflight("NABIL share price"))
+
+    def test_ipo_details_query_falls_through(self) -> None:
+        # "NABIL IPO ko details" is a company-detail query — let Sarvam
+        # pick (likely internet_search for full prospectus).
+        self.assertIsNone(plan_preflight("NABIL IPO ko full details"))
+
+    def test_time_sensitive_ipo_news_hits_news_path(self) -> None:
+        # "aja ko ipo baadfad" is a time-sensitive news request — the
+        # general_news catch-all rule fires intentionally so OSINT's
+        # recent-stories endpoint picks up today's allotment news.
+        plan = plan_preflight("aja ko ipo baadfad bhayo ki?")
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan[1]["intent"], "general_news")
 
 
 class NoMatchTests(unittest.TestCase):

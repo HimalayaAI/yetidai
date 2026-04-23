@@ -36,9 +36,7 @@ from tools.osint.context_router import (
     GOVT_KEYWORDS,
     MACRO_KEYWORDS,
     PARLIAMENT_KEYWORDS,
-    TRADING_KEYWORDS,
     _contains_any,
-    _has_nepse_ticker,
     detect_minister_role,
 )
 
@@ -118,18 +116,19 @@ def plan_preflight(user_text: str | None) -> tuple[str, dict[str, Any]] | None:
             {"intent": "macro", "focus": "inflation"},
         )
 
-    # 4. NEPSE ticker (e.g. "RURU", "NABIL") + trading context.
-    ticker = _extract_ticker(text)
-    if ticker:
-        return (
-            "get_nepal_live_context",
-            {"intent": "trading", "focus": ticker},
-        )
-    if _contains_any(lowered, TRADING_KEYWORDS):
-        return (
-            "get_nepal_live_context",
-            {"intent": "trading", "focus": "nepse"},
-        )
+    # NOTE: ticker / trading queries used to preflight into OSINT's
+    # trading intent, but OSINT's trading endpoints return news rows
+    # about a ticker — not the rich company background (capacity,
+    # developer, project location, COD) users want for "RURU share
+    # ko barima information". Sarvam's own choice — internet_search
+    # against ruruhydro.com / icranepal.com / doed.gov.np / wikipedia
+    # / merolagani — is strictly better for these. So we deliberately
+    # do NOT preflight ticker/trading queries; let Sarvam pick.
+    #
+    # If the reactive force-tool retry finds an empty-promise reply,
+    # it'll still fire a tool call. The fast-path preflight is for
+    # shapes where Sarvam was RELIABLY picking the wrong tool (news,
+    # minister names, GDP), not for shapes where it was working.
 
     # 5. Public debt.
     if _contains_any(lowered, DEBT_KEYWORDS):

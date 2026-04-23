@@ -38,6 +38,23 @@ from tools.osint.freshness import assess_freshness
 STALE_DATA_MARKER = "[STALE_DATA]"
 
 
+def _nepal_scoped_query(raw: str) -> str:
+    """Build a Nepal-scoped query for the internet_search fallback.
+
+    Without this, a bare "aja ko samachar" / "आजको news" fallback query
+    on DuckDuckGo returns Hindi-language Indian news portals (aajtak.in,
+    indiatv.in, amarujala.com — observed in production). Prepending
+    "Nepal" biases the SERP toward Nepal-domain sources.
+    """
+    q = (raw or "").strip()
+    if not q:
+        return "Nepal news today"
+    lowered = q.lower()
+    if "nepal" in lowered or "नेपाल" in q:
+        return q
+    return f"Nepal {q}"
+
+
 # ── Tool specification ────────────────────────────────────────────
 
 OSINT_SPEC = ToolSpec(
@@ -227,7 +244,7 @@ async def handle_osint(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResul
                 raw_data=payloads or None,
                 trigger_fallback=True,
                 fallback_tool="internet_search",
-                fallback_args={"query": ctx.query},
+                fallback_args={"query": _nepal_scoped_query(ctx.query)},
                 meta=meta,
             )
 
@@ -247,7 +264,7 @@ async def handle_osint(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResul
                 raw_data=payloads or None,
                 trigger_fallback=True,
                 fallback_tool="internet_search",
-                fallback_args={"query": ctx.query},
+                fallback_args={"query": _nepal_scoped_query(ctx.query)},
                 meta=meta,
             )
 
@@ -268,7 +285,7 @@ async def handle_osint(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResul
             error=f"{type(exc).__name__}: {exc}",
             trigger_fallback=True,
             fallback_tool="internet_search",
-            fallback_args={"query": ctx.query},
+            fallback_args={"query": _nepal_scoped_query(ctx.query)},
         )
 
 
