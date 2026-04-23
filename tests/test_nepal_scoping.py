@@ -36,6 +36,22 @@ class NepalScopedQueryTests(unittest.TestCase):
     def test_none_fallbacks_to_default(self) -> None:
         self.assertEqual(_nepal_scoped_query(None), "Nepal news today")
 
+    def test_strips_nepalosint_meta_token(self) -> None:
+        """'nepalosint bata X' should search for X (Nepal-scoped),
+        not search for the phrase 'nepalosint'."""
+        out = _nepal_scoped_query("nepalosint bata political samachar haru")
+        # "nepalosint bata" is gone.
+        self.assertNotIn("nepalosint", out.lower())
+        # The actual intent survives.
+        self.assertIn("samachar", out)
+        # Still Nepal-scoped.
+        self.assertIn("Nepal", out)
+
+    def test_strips_osint_ma(self) -> None:
+        out = _nepal_scoped_query("osint ma aja ko khabar")
+        self.assertNotIn("osint", out.lower())
+        self.assertIn("khabar", out)
+
 
 class NepalScopedDetectionTests(unittest.TestCase):
     def test_english_nepal(self) -> None:

@@ -219,6 +219,21 @@ GOVT_KEYWORDS = {
     "decisons",   # common misspelling seen in logs
     "nirnaya",
     "naya nirnaya",
+    # Resignation / appointment events — always political/government
+    # news. "sudan gurung le kina resign gareyko" would otherwise
+    # fall through to the news catch-all; routing to government makes
+    # OSINT hit govt-decisions + announcements where the resignation
+    # is actually recorded.
+    "resign",
+    "resigned",
+    "resignation",
+    "राजीनामा",
+    "rajinama",
+    "rajeenama",
+    "appointment",
+    "appointed",
+    "नियुक्ति",
+    "niyukti",
 }
 
 DEBT_KEYWORDS = {
@@ -770,6 +785,14 @@ async def fetch_context_bundle(client: Any, query: str, plan: RoutePlan) -> dict
     if "government" in plan.intents:
         tasks["govt_decisions"] = client.get_govt_decisions_latest(limit=min(10, max_items), dedupe=True)
         tasks["announcements"] = client.get_announcements_summary(limit=min(10, max_items))
+        # Real political news stories — resignations, appointments,
+        # party moves live in /analytics/consolidated-stories with
+        # category=political, not in /govt-decisions. Without this
+        # fetch, "sudan gurung le kina resign gareyko" would only
+        # see formal cabinet orders and miss the resignation story.
+        tasks["political_stories"] = client.get_consolidated_recent(
+            hours=72, limit=min(8, max_items), category="political",
+        )
 
     if "debt" in plan.intents:
         tasks["debt_clock"] = client.get_debt_clock()

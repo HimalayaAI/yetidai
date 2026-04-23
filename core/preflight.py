@@ -56,6 +56,53 @@ _NEWS_HINT_RE = re.compile(
 )
 _NEWS_HINT_DEV_RE = re.compile(r"(समाचार|खबर|ताजा|आज)")
 
+# Politics-scoped news. "political samachar" / "राजनीतिक खबर" / etc.
+# deserves the consolidated-stories endpoint with category=political
+# so the bundle hits actual political stories (parliament, cabinet,
+# party moves) instead of the generic recent-stories stream which
+# can be economic-heavy.
+_POLITICS_RE = re.compile(
+    r"\b(political|politics|raajnitik|rajnitik|rajniti)\b",
+    re.IGNORECASE,
+)
+_POLITICS_DEV_RE = re.compile(r"(राजनीत|राजनीति|राजनीतिक)")
+
+# Explicit "use web search" / "use google" commands. When the user
+# literally tells us to go search, preflight routes to internet_search
+# instead of whatever our usual classifier picked. Addresses the
+# "web search garnus alchi nagarnus google chalaunus" trace.
+_EXPLICIT_WEB_SEARCH_RE = re.compile(
+    r"(web\s*search|google\s*(?:chalaunus|chalaun|garnus|gara|garau|gar)|"
+    r"online\s*(?:khoju|search)|internet\s*bata|"
+    r"google\s*ma|google\s*garera|google\s*garnus|"
+    r"गुगल|वेब\s*सर्च|इन्टरनेटमा)",
+    re.IGNORECASE,
+)
+
+# Tokens we strip when forwarding a user's "web search X" command to
+# the search tool — leaves just the actual search subject.
+_COMMAND_STRIP_RE = re.compile(
+    r"\b(web\s*search|google\s*(?:chalaunus|chalaun|garnus|garera|gara|garau|gar)|"
+    r"online\s*(?:khoju|search)|internet\s*bata|alchi\s*nagarnus|"
+    r"please|kripaya|hajur|garnus|garnu)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_command_tokens(text: str) -> str:
+    """Remove imperative words so 'web search garnus Nepal PM' becomes
+    'Nepal PM' — a much cleaner query for DuckDuckGo."""
+    cleaned = _COMMAND_STRIP_RE.sub(" ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.!?")
+    return cleaned or text
+
+
+def _is_political_news_request(text: str, lowered: str) -> bool:
+    """User asked for political news specifically."""
+    if _POLITICS_RE.search(lowered) or _POLITICS_DEV_RE.search(text):
+        return True
+    return False
+
 
 def _extract_first_url(text: str) -> str | None:
     m = _URL_RE.search(text or "")
@@ -96,6 +143,11 @@ def plan_preflight(user_text: str | None) -> tuple[str, dict[str, Any]] | None:
             return ("analyze_github_repo", {"repo": url})
         return ("fetch_url", {"url": url})
 
+    # 1a. Explicit "web search" command — honour the user's direction.
+    # "web search garnus", "google garera heru na", "online khoju".
+    if _EXPLICIT_WEB_SEARCH_RE.search(lowered):
+        return ("internet_search", {"query": _strip_command_tokens(text)})
+
     # 2. Minister role → government + who_is (OSINT handler reads these
     #    from the route plan; `focus` carries the canonical role tag).
     role = detect_minister_role(text)
@@ -129,6 +181,17 @@ def plan_preflight(user_text: str | None) -> tuple[str, dict[str, Any]] | None:
     # it'll still fire a tool call. The fast-path preflight is for
     # shapes where Sarvam was RELIABLY picking the wrong tool (news,
     # minister names, GDP), not for shapes where it was working.
+
+    # 4.5 Political news — "political samachar" / "राजनीतिक खबर".
+    # Routes to government intent which hits govt-decisions +
+    # announcements + political-categorised stories. Placed before
+    # the debt/parliament/govt rules so the more specific news
+    # framing wins (we want *news stories*, not a cabinet dump).
+    if _is_political_news_request(text, lowered):
+        return (
+            "get_nepal_live_context",
+            {"intent": "government", "focus": "political_news"},
+        )
 
     # 5. Public debt.
     if _contains_any(lowered, DEBT_KEYWORDS):

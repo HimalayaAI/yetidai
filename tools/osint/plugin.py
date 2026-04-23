@@ -38,15 +38,33 @@ from tools.osint.freshness import assess_freshness
 STALE_DATA_MARKER = "[STALE_DATA]"
 
 
+import re as _re
+
+# Meta-tokens users type to refer to the tool itself — "nepalosint bata",
+# "nepalosint ma", "osint ko" etc. Left in the fallback query, DDG
+# returns my own skeleton GitHub repo and random YouTube videos. Strip
+# them before passing to internet_search.
+_OSINT_META_TOKEN_RE = _re.compile(
+    r"\b(nepal\s*osint|nepalosint|osint)\b[^\s]*\s*(bata|ma|le|ko|bhanus|bhana|suna|sunau)?",
+    _re.IGNORECASE,
+)
+
+
 def _nepal_scoped_query(raw: str) -> str:
     """Build a Nepal-scoped query for the internet_search fallback.
 
-    Without this, a bare "aja ko samachar" / "आजको news" fallback query
-    on DuckDuckGo returns Hindi-language Indian news portals (aajtak.in,
-    indiatv.in, amarujala.com — observed in production). Prepending
-    "Nepal" biases the SERP toward Nepal-domain sources.
+    Three transforms, in order:
+      1. Strip meta-tokens ("nepalosint bata", "osint ma", …) so DDG
+         doesn't return my own skeleton repo / yt videos about the tool.
+      2. Prepend "Nepal " if neither "nepal" nor "नेपाल" is present.
+      3. Collapse whitespace.
+    Defaults to "Nepal news today" on empty input.
     """
     q = (raw or "").strip()
+    if not q:
+        return "Nepal news today"
+    q = _OSINT_META_TOKEN_RE.sub(" ", q).strip()
+    q = _re.sub(r"\s+", " ", q)
     if not q:
         return "Nepal news today"
     lowered = q.lower()

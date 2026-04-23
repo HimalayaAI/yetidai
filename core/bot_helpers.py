@@ -637,6 +637,54 @@ def _extract_host(url: str) -> str | None:
         return None
 
 
+# News-org names that frequently appear in hallucinated स्रोत: blocks.
+# When the model cites one of these WITHOUT a URL to back it, flag as
+# fabricated — Yeti was caught writing "स्रोत: The Associated Press,
+# Reuters" with no links and no real tool output from either source.
+_FAKE_SOURCE_NAMES: frozenset[str] = frozenset({
+    "the associated press", "associated press", "ap ",
+    "reuters", "bbc", "cnn", "al jazeera", "aljazeera",
+    "new york times", "the guardian", "washington post",
+    "bloomberg", "economist", "financial times",
+})
+
+
+def detect_fabricated_source_names(
+    answer: str, tool_output: str,
+) -> list[str]:
+    """Return news-org names cited in the answer's स्रोत: block that
+    have neither a URL next to them nor any appearance in tool_output.
+
+    This is the AP/Reuters fake-citation pattern — the model names a
+    western outlet as a source but the outlet was never hit by any
+    tool this turn.
+    """
+    if not answer or "स्रोत:" not in answer:
+        return []
+    idx = answer.rfind("स्रोत:")
+    sources_block = answer[idx:]
+    # If the sources block has URLs, the URL-level validator already
+    # covers us. We only run this when the block is URL-free (a
+    # classic hallucination shape).
+    if URL_RE.search(sources_block):
+        return []
+    lowered_block = sources_block.lower()
+    lowered_tool = (tool_output or "").lower()
+    bad: list[str] = []
+    for name in _FAKE_SOURCE_NAMES:
+        if name in lowered_block and name not in lowered_tool:
+            bad.append(name.strip().rstrip())
+    # Dedupe, preserve order, title-case for the user-facing message.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for n in bad:
+        key = n.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(n.title() if n.isascii() else n)
+    return unique
+
+
 def detect_fabricated_filenames(answer: str, tool_output: str) -> list[str]:
     """Return file names cited in `answer` that do not appear in `tool_output`.
 

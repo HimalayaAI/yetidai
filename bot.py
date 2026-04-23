@@ -74,6 +74,7 @@ from core.bot_helpers import (
     chunk_for_discord,
     classify_llm_error,
     detect_fabricated_filenames,
+    detect_fabricated_source_names,
     detect_fabricated_urls,
     detect_requested_count,
     ensure_sources_line,
@@ -910,10 +911,11 @@ async def on_message(message):
             joined_output = "\n".join(tool_output_accum)
             fabricated_files = detect_fabricated_filenames(ai_response, joined_output)
             fabricated_urls = detect_fabricated_urls(ai_response, joined_output)
-            if fabricated_files or fabricated_urls:
+            fabricated_srcs = detect_fabricated_source_names(ai_response, joined_output)
+            if fabricated_files or fabricated_urls or fabricated_srcs:
                 logger.info(
-                    "Fabrication in answer (turn=%s): files=%s urls=%s — retrying.",
-                    turn_id, fabricated_files, fabricated_urls,
+                    "Fabrication in answer (turn=%s): files=%s urls=%s names=%s — retrying.",
+                    turn_id, fabricated_files, fabricated_urls, fabricated_srcs,
                 )
                 parts = []
                 if fabricated_files:
@@ -925,6 +927,11 @@ async def on_message(message):
                     parts.append(
                         f"यी URL tool output मा छैनन् (hallucinated): "
                         f"{', '.join(fabricated_urls)}"
+                    )
+                if fabricated_srcs:
+                    parts.append(
+                        f"यी news-org नामहरू (source block मा) tool output "
+                        f"मा कहीँ देखिँदैनन्: {', '.join(fabricated_srcs)}"
                     )
                 nudge = (
                     " | ".join(parts)
@@ -945,6 +952,30 @@ async def on_message(message):
                             ai_response = corrected
                 except Exception:
                     logger.exception("Anti-hallucination retry failed; keeping answer")
+
+                # Final line of defence: if the retry STILL has
+                # fabricated source names AND no real URLs in tool
+                # output, replace with an honest "I don't have info"
+                # instead of shipping an invented citation again.
+                # User quote: "if it doesnt find straightup say I
+                # dont have info".
+                still_bad = detect_fabricated_source_names(
+                    ai_response, joined_output,
+                )
+                if still_bad:
+                    logger.info(
+                        "Hallucinated sources persisted after retry "
+                        "(turn=%s): %s — replacing with honest apology.",
+                        turn_id, still_bad,
+                    )
+                    ai_response = (
+                        "माफ गर्नुहोस् हजुर — यो प्रश्नको लागि मलाई "
+                        "भरपर्दो source भेटिएन। NepalOSINT मा यो विषय "
+                        "अहिले indexed छैन, र web search ले पनि "
+                        "पुष्टि गर्न सकिने लिङ्क दिएन। काल्पनिक "
+                        "स्रोत लेख्ननभन्दा खुलस्त भन्दै छु: मलाई "
+                        "थाहा भएन।"
+                    )
 
         # ── Deterministic fixups + validator retry (non-fatal) ────
         if ai_response and llm_exc is None:
