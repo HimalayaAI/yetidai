@@ -73,25 +73,29 @@ class MacroPreflightTests(unittest.TestCase):
         self.assertEqual(plan[1]["intent"], "macro")
 
 
-class TradingPreflightIsSkippedTests(unittest.TestCase):
-    """Ticker / trading queries are intentionally NOT preflighted.
-
-    OSINT's trading endpoints return news mentions of a ticker, not
-    rich company background. Sarvam's own internet_search call against
-    ruruhydro.com / icranepal.com / doed.gov.np gives the user better
-    project details — capacity, developer, COD — so we let Sarvam pick.
+class TradingPreflightPolicyTests(unittest.TestCase):
+    """Ticker / trading query routing policy:
+      - ticker + "details/information" → internet_search (rich
+        company background from ruruhydro / icranepal / doed).
+      - bare ticker or "ticker price" → fall through to Sarvam.
     """
 
-    def test_ticker_falls_through_to_sarvam(self) -> None:
-        self.assertIsNone(plan_preflight("RURU hydropower share ko barima information"))
+    def test_ticker_with_details_goes_to_web(self) -> None:
+        plan = plan_preflight("RURU hydropower share ko barima information")
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan[0], "internet_search")
 
-    def test_nepse_alone_falls_through(self) -> None:
+    def test_nabil_price_falls_through(self) -> None:
+        # No "details" qualifier — bare price check — falls to Sarvam.
         self.assertIsNone(plan_preflight("NABIL share price"))
 
-    def test_ipo_details_query_falls_through(self) -> None:
-        # "NABIL IPO ko details" is a company-detail query — let Sarvam
-        # pick (likely internet_search for full prospectus).
-        self.assertIsNone(plan_preflight("NABIL IPO ko full details"))
+    def test_nabil_full_details_goes_to_web(self) -> None:
+        # "full details" qualifier — web fetch.
+        plan = plan_preflight("NABIL IPO ko full details")
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan[0], "internet_search")
 
     def test_time_sensitive_ipo_news_hits_news_path(self) -> None:
         # "aja ko ipo baadfad" is a time-sensitive news request — the

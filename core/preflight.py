@@ -148,10 +148,26 @@ def plan_preflight(user_text: str | None) -> tuple[str, dict[str, Any]] | None:
     if _EXPLICIT_WEB_SEARCH_RE.search(lowered):
         return ("internet_search", {"query": _strip_command_tokens(text)})
 
-    # 2. Minister role → government + who_is (OSINT handler reads these
-    #    from the route plan; `focus` carries the canonical role tag).
+    # 2. Minister role → government + who_is. For "current / अहिले"
+    #    identity queries, parallel-fire a web search because Wikipedia
+    #    caches lag Nepal's real political changes (observed: Yeti cited
+    #    Sushila Karki as PM when Balen Shah was actually sitting PM —
+    #    the wikipedia page hadn't updated). Returning internet_search
+    #    as the preflight tool for the "current PM" shape gets fresh
+    #    news over stale reference pages.
     role = detect_minister_role(text)
     if role:
+        is_current = bool(
+            re.search(r"\b(current|currently|now|ahile|right\s*now)\b", lowered)
+            or re.search(r"(अहिले|हाल)", text)
+        )
+        if is_current:
+            # Fresh news over stale reference. The search plugin's
+            # Nepal-host filter keeps results on-domain; the
+            # fabricated-source-name guard in bot.py catches any
+            # "Reuters/AP" flim-flam.
+            role_label = role.replace("_", " ")
+            return ("internet_search", {"query": f"current {role_label} of Nepal 2026"})
         return (
             "get_nepal_live_context",
             {"intent": "government", "focus": role},
@@ -168,19 +184,34 @@ def plan_preflight(user_text: str | None) -> tuple[str, dict[str, Any]] | None:
             {"intent": "macro", "focus": "inflation"},
         )
 
-    # NOTE: ticker / trading queries used to preflight into OSINT's
-    # trading intent, but OSINT's trading endpoints return news rows
-    # about a ticker — not the rich company background (capacity,
-    # developer, project location, COD) users want for "RURU share
-    # ko barima information". Sarvam's own choice — internet_search
-    # against ruruhydro.com / icranepal.com / doed.gov.np / wikipedia
-    # / merolagani — is strictly better for these. So we deliberately
-    # do NOT preflight ticker/trading queries; let Sarvam pick.
-    #
-    # If the reactive force-tool retry finds an empty-promise reply,
-    # it'll still fire a tool call. The fast-path preflight is for
-    # shapes where Sarvam was RELIABLY picking the wrong tool (news,
-    # minister names, GDP), not for shapes where it was working.
+    # Ticker + company-details requests — force internet_search.
+    # OSINT's trading endpoints have sparse ticker coverage (typically
+    # just the latest bonus-share / dividend announcement), so for
+    # "RURU ko details / project information / background" the right
+    # tool is a web search against the company's own site + icranepal
+    # + doed.gov.np + merolagani. Without this rule Sarvam tends to
+    # call OSINT trading and come back with a one-line answer.
+    ticker = _extract_ticker(text)
+    wants_details = bool(
+        re.search(
+            r"\b(details?|information|info|background|profile|barima|"
+            r"overview|project|company|baare|barema|barima)\b",
+            lowered,
+            re.IGNORECASE,
+        )
+        or re.search(r"(विवरण|जानकारी|बारे|बारेमा|प्रोफाइल)", text)
+    )
+    if ticker and wants_details:
+        # Build a rich web query: "RURU hydropower Nepal project details"
+        parts = [ticker, "Nepal"]
+        if re.search(r"hydro|jal", lowered):
+            parts.append("hydropower")
+        parts.append("project details")
+        return ("internet_search", {"query": " ".join(parts)})
+
+    # Bare ticker (no "details" qualifier) → fall through, let Sarvam
+    # decide. If it picks OSINT it gets the ticker news; if it picks
+    # internet_search it gets background. Either is acceptable.
 
     # 4.5 Political news — "political samachar" / "राजनीतिक खबर".
     # Routes to government intent which hits govt-decisions +
