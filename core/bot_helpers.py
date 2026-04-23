@@ -396,6 +396,127 @@ def build_correction_nudge(
     )
 
 
+# ── Empty-promise / tool-use enforcement ─────────────────────────
+#
+# Production failure: user asks "aja ko samachar sunau", Sarvam replies
+# "म नेपालको आजको ताजा समाचार बताउँछु।" and stops — no tool_call, no
+# actual news. The bot sends the promise straight to Discord because
+# nothing detects "you vowed but didn't deliver". These helpers catch
+# that shape so bot.py can inject a forcing nudge and retry once.
+
+_EMPTY_PROMISE_PATTERNS: tuple["re.Pattern[str]", ...] = (
+    re.compile(r"म .{0,40}बताउँछु"),         # "म समाचार बताउँछु"
+    re.compile(r"म .{0,40}सुनाउँछु"),          # "म खबर सुनाउँछु"
+    re.compile(r"म .{0,40}भन्छु"),            # "म भन्छु"
+    re.compile(r"म .{0,40}दिन्छु"),            # "म जानकारी दिन्छु"
+    re.compile(r"म .{0,40}प्रदान गर्छु"),       # "म समाचार प्रदान गर्छु"
+    re.compile(r"म .{0,40}पठाउँछु"),          # "म पठाउँछु"
+    re.compile(r"let me (fetch|search|check|look)", re.IGNORECASE),
+    re.compile(r"i ?(will|'ll) (fetch|search|check|look|provide|get|tell)", re.IGNORECASE),
+    re.compile(r"तपाईंलाई .{0,40}(बताउँछु|सुनाउँछु|दिन्छु|पठाउँछु)"),
+)
+
+# Short reply + any promise pattern is the smoking-gun shape. Long
+# replies often contain "म बताउँछु" as a natural phrase inside a real
+# answer, so we gate on length to keep false-positives low.
+_EMPTY_PROMISE_MAX_CHARS = 240
+
+
+def is_empty_promise(text: str | None, *, tool_was_used: bool = False) -> bool:
+    """Heuristic: did the model promise to do something without doing it?
+
+    Criteria (all must hold):
+      1. No tool was successfully used this turn.
+      2. The reply is short — promises are almost always one-liners.
+      3. At least one empty-promise pattern matches.
+    """
+    if tool_was_used or not text:
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped) > _EMPTY_PROMISE_MAX_CHARS:
+        return False
+    return any(pat.search(stripped) for pat in _EMPTY_PROMISE_PATTERNS)
+
+
+# Patterns that strongly suggest the turn needs a tool call. Used to
+# decide whether an empty-promise retry is worthwhile — if the user
+# was chatting, let it go; if they asked for data, force Sarvam to
+# actually call a tool.
+_TOOL_NEEDED_PATTERNS: tuple["re.Pattern[str]", ...] = (
+    # URLs of any kind
+    re.compile(r"https?://", re.IGNORECASE),
+    # Nepal info keywords (English / romanized / Devanagari)
+    re.compile(
+        r"\b(news|samachar|khabar|halkhabar|update|inflation|nepse|"
+        r"parliament|cabinet|minister|pradanmantri|arthamantri|"
+        r"pm|ipo|dividend|rin|ऋण|कर्जा)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(समाचार|खबर|मुद्रास्फीति|रेमिट्यान्स|मन्त्री|प्रधानमन्त्री|संसद|विधेयक)"),
+    # Explicit date phrases ("aja", "आज", "today", ISO date)
+    re.compile(r"\b(aja|aaja|today|hijo|yesterday|bhako|bhayo)\b", re.IGNORECASE),
+    re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
+    # "who is X / X ko ho" identity probes
+    re.compile(r"\b(who is|ko ho|को हो|को हुन|को हुनुहुन्छ)\b", re.IGNORECASE),
+)
+
+
+def needs_tool_use(user_text: str | None) -> bool:
+    """True if the user's message likely requires a tool call to answer.
+
+    Conservative: only returns True on strong positive signals. Small-talk
+    and freeform chat returns False so we don't force tools on "नमस्ते"
+    or "k xa".
+    """
+    if not user_text:
+        return False
+    return any(pat.search(user_text) for pat in _TOOL_NEEDED_PATTERNS)
+
+
+def build_force_tool_nudge(user_text: str) -> str:
+    """System message used to retry after an empty-promise answer.
+
+    Kept short so it doesn't push the already-long system prompt off the
+    attention window. The model sees this AFTER its promise text, so it
+    effectively reads: "I said I'd fetch. System reminder: actually fetch."
+    """
+    return (
+        "तपाईंले अघिल्लो turn मा कुनै tool call emit नगरी 'म बताउँछु' जस्तो "
+        "वाचा मात्र लेख्नुभयो। यो bug हो — प्रयोगकर्ताले actual data माग्दै "
+        "हुनुहुन्छ। अहिले नै उपयुक्त tool call emit गर्नुहोस् "
+        "(get_nepal_live_context / internet_search / fetch_url / "
+        "analyze_github_repo मध्ये एक)। वाचा नगरी सिधै tool call दिनुहोस्।"
+    )
+
+
+# ── Anti-hallucination for GitHub answers ────────────────────────
+#
+# Production failure: analyze_github_repo ran, returned the real tree,
+# but Sarvam still invented "NepaliNewsAggregator.py" in its answer
+# (a file that doesn't exist in the repo). This helper flags any file
+# name the model cites that isn't present in the actual tool output.
+
+_FILENAME_IN_ANSWER_RE = re.compile(
+    r"\b([\w.\-]+\.(?:py|md|ts|tsx|js|jsx|json|yaml|yml|toml|txt|rs|go|java|kt|rb|c|cpp|h|sh))\b"
+)
+
+
+def detect_fabricated_filenames(answer: str, tool_output: str) -> list[str]:
+    """Return file names cited in `answer` that do not appear in `tool_output`.
+
+    Empty list = no obvious fabrication. `tool_output` is the concatenated
+    content of any analyze_github_repo / fetch_url / internet_search
+    tool results this turn — if a file name in the answer doesn't appear
+    there, the model hallucinated it.
+    """
+    if not answer or not tool_output:
+        return []
+    answer_names = set(_FILENAME_IN_ANSWER_RE.findall(answer))
+    if not answer_names:
+        return []
+    return sorted(n for n in answer_names if n not in tool_output)
+
+
 def ensure_sources_line(
     answer: str,
     citation_urls: Iterable[str],

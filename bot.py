@@ -67,16 +67,20 @@ from core.bot_helpers import (
     TOOL_STALE_MARKER,
     TOOL_TIMEOUT_MARKER,
     build_correction_nudge,
+    build_force_tool_nudge,
     chunk_for_discord,
     classify_llm_error,
+    detect_fabricated_filenames,
     detect_requested_count,
     ensure_sources_line,
     extract_urls,
     hash_tool_call,
     is_bot_apology,
+    is_empty_promise,
     is_real_tool_content,
     is_transient_llm_error,
     looks_like_correction,
+    needs_tool_use,
     normalize_digits,
     safe_field_value,
     split_body_and_sources,
@@ -348,21 +352,36 @@ async def on_message(message):
             )
             messages = [{"role": "system", "content": dynamic_system_prompt}]
 
+            # Per-message try/except: one weird Discord message (None
+            # content, missing author, system notification) shouldn't
+            # nuke the whole turn — skip it and carry on.
             for prev_msg in previous_messages:
-                if prev_msg.id == message.id or not prev_msg.content.strip():
-                    continue
-                if prev_msg.author == bot.user:
-                    if is_bot_apology(prev_msg.content):
+                try:
+                    if prev_msg.id == message.id:
                         continue
-                    messages.append({
-                        "role": "assistant",
-                        "content": prev_msg.content,
-                    })
-                else:
-                    messages.append({
-                        "role": "user",
-                        "content": f"{prev_msg.author.name}: {prev_msg.content}",
-                    })
+                    content = getattr(prev_msg, "content", None) or ""
+                    if not content.strip():
+                        continue
+                    if prev_msg.author == bot.user:
+                        if is_bot_apology(content):
+                            continue
+                        messages.append({
+                            "role": "assistant",
+                            "content": content,
+                        })
+                    else:
+                        author_name = getattr(
+                            getattr(prev_msg, "author", None), "name", "user",
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": f"{author_name}: {content}",
+                        })
+                except Exception:
+                    logger.exception(
+                        "Skipping bad history message (turn=%s)", turn_id,
+                    )
+                    continue
 
             # Correction / count-intent nudges. These are cheap signals that
             # materially change the model's next turn — we inject them as
@@ -416,6 +435,10 @@ async def on_message(message):
         dedup_cache: dict[str, ToolResult] = {}
         last_round_signature: tuple | None = None
         final_nudge_injected = False
+        # Accumulated tool content for the turn — used by the post-answer
+        # hallucination check (e.g. analyze_github_repo returned tree doesn't
+        # list `NepaliNewsAggregator.py`, but the model cited it anyway).
+        tool_output_accum: list[str] = []
         try:
             for _round in range(MAX_TOOL_ROUNDS):
                 is_last_round = (_round == MAX_TOOL_ROUNDS - 1)
@@ -536,6 +559,8 @@ async def on_message(message):
                     tool_calls_log.append(log_entry)
                     if is_real_tool_content(result):
                         tool_was_used = True
+                        if result.content:
+                            tool_output_accum.append(result.content)
                     citation_urls.extend(extract_urls(result.content))
 
                     if result.meta:
@@ -609,6 +634,8 @@ async def on_message(message):
                         })
                         if is_real_tool_content(fb_result):
                             tool_was_used = True
+                            if fb_result.content:
+                                tool_output_accum.append(fb_result.content)
                         citation_urls.extend(extract_urls(fb_result.content))
                         fallback_used = True
                         logger.info(
@@ -621,9 +648,140 @@ async def on_message(message):
             # Extract final answer
             if response and getattr(response, "choices", None):
                 ai_response = response.choices[0].message.content or ""
+
+            # Empty-promise rescue: the model wrote "म बताउँछु" / "let me
+            # fetch" and stopped — no tool_call, no data. If the user's
+            # query clearly needed a tool, inject a forcing system message
+            # and spend one more LLM turn with tools available.
+            if (
+                is_empty_promise(ai_response, tool_was_used=tool_was_used)
+                and needs_tool_use(chad.user_input)
+                and tools_array
+            ):
+                logger.info(
+                    "Empty-promise detected (turn=%s): %r — forcing tool retry.",
+                    turn_id, ai_response[:100],
+                )
+                messages.append({"role": "assistant", "content": ai_response})
+                messages.append({
+                    "role": "system",
+                    "content": build_force_tool_nudge(chad.user_input),
+                })
+                try:
+                    force_resp = await _run_llm_turn(
+                        messages, tools_array=tools_array, tool_choice="auto",
+                    )
+                except Exception:
+                    force_resp = None
+                if force_resp and getattr(force_resp, "choices", None):
+                    force_choice = force_resp.choices[0]
+                    force_calls = getattr(force_choice.message, "tool_calls", None) or []
+                    if force_calls:
+                        # Execute the forced calls and feed results back.
+                        messages.append({
+                            "role": "assistant",
+                            "content": force_choice.message.content or "",
+                            "tool_calls": [
+                                {
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
+                                    },
+                                }
+                                for tc in force_calls
+                            ],
+                        })
+                        ctx_force = ToolContext(
+                            query=chad.user_input,
+                            history=previous_messages,
+                            llm_client=llm_client,
+                            channel_id=message.channel.id,
+                            user_id=message.author.id,
+                        )
+                        force_exec = await asyncio.gather(*[
+                            _execute_tool_call(
+                                tc, ctx_force,
+                                dedup_cache=dedup_cache,
+                                default_timeout=YETI_TOOL_TIMEOUT,
+                            )
+                            for tc in force_calls
+                        ])
+                        for (tc_id, args, result, log_extra) in force_exec:
+                            messages.append(result.to_tool_message(tc_id))
+                            if is_real_tool_content(result):
+                                tool_was_used = True
+                                if result.content:
+                                    tool_output_accum.append(result.content)
+                            citation_urls.extend(extract_urls(result.content))
+                            tool_calls_log.append({
+                                "name": next(
+                                    (t.function.name for t in force_calls if t.id == tc_id),
+                                    tc_id,
+                                ),
+                                "args": args,
+                                "success": result.success,
+                                "forced": True,
+                                **log_extra,
+                            })
+                        # Ask Sarvam to compose the real answer now (no more tools).
+                        final_resp = await _run_llm_turn(
+                            messages, tools_array=None, tool_choice=None,
+                        )
+                        if final_resp and getattr(final_resp, "choices", None):
+                            forced_answer = final_resp.choices[0].message.content or ""
+                            if forced_answer.strip():
+                                ai_response = forced_answer
+                    else:
+                        # Model emitted text again on forced round — keep it
+                        # only if it's no longer an empty promise.
+                        retry_text = force_choice.message.content or ""
+                        if retry_text and not is_empty_promise(retry_text):
+                            ai_response = retry_text
         except Exception as exc:
             logger.exception("Sarvam call / tool loop failed")
             llm_exc = exc
+
+        # ── Anti-hallucination: fabricated filenames ─────────────
+        #
+        # When analyze_github_repo / fetch_url / internet_search returned
+        # real content, the final answer must not cite file names that
+        # aren't in that content. If we find one, inject a correction
+        # system message and retry once with no tools (the right data is
+        # already in context).
+        if (
+            ai_response
+            and llm_exc is None
+            and tool_output_accum
+        ):
+            joined_output = "\n".join(tool_output_accum)
+            fabricated = detect_fabricated_filenames(ai_response, joined_output)
+            if fabricated:
+                logger.info(
+                    "Fabricated filenames in answer (turn=%s): %s — retrying once.",
+                    turn_id, fabricated,
+                )
+                messages.append({"role": "assistant", "content": ai_response})
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"तपाईंको जवाफमा यी फाइल नामहरू छन् जुन tool output मा "
+                        f"छैनन्: {', '.join(fabricated)}। यी काल्पनिक हुन् — "
+                        "hallucination। पुनः लेख्नुहोस्, केवल tool output मा "
+                        "देखिएका फाइल / feature मात्र उल्लेख गर्नुहोस्।"
+                    ),
+                })
+                try:
+                    anti_resp = await _run_llm_turn(
+                        messages, tools_array=None, tool_choice=None,
+                    )
+                    if anti_resp and getattr(anti_resp, "choices", None):
+                        corrected = anti_resp.choices[0].message.content or ""
+                        if corrected.strip():
+                            ai_response = corrected
+                except Exception:
+                    logger.exception("Anti-hallucination retry failed; keeping answer")
 
         # ── Deterministic fixups + validator retry (non-fatal) ────
         if ai_response and llm_exc is None:
