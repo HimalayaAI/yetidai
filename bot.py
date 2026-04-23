@@ -64,15 +64,19 @@ from core.bot_helpers import (
     GENERIC_TECH_ERROR,
     TOOL_DEDUP_MARKER,
     TOOL_ERROR_MARKER,
+    TOOL_STALE_MARKER,
     TOOL_TIMEOUT_MARKER,
+    build_correction_nudge,
     chunk_for_discord,
     classify_llm_error,
+    detect_requested_count,
     ensure_sources_line,
     extract_urls,
     hash_tool_call,
     is_bot_apology,
     is_real_tool_content,
     is_transient_llm_error,
+    looks_like_correction,
     normalize_digits,
     safe_field_value,
     split_body_and_sources,
@@ -83,9 +87,13 @@ from core.bot_helpers import (
 # ── Register plugins ──────────────────────────────────────────────
 import tools.osint.plugin as osint_plugin
 import tools.search.plugin as search_plugin
+import tools.fetch.plugin as fetch_plugin
+import tools.github.plugin as github_plugin
 
 osint_plugin.register()
 search_plugin.register()
+fetch_plugin.register()
+github_plugin.register()
 # ── Initialization ────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -356,6 +364,26 @@ async def on_message(message):
                         "content": f"{prev_msg.author.name}: {prev_msg.content}",
                     })
 
+            # Correction / count-intent nudges. These are cheap signals that
+            # materially change the model's next turn — we inject them as
+            # a system message RIGHT BEFORE the current user turn so Sarvam
+            # reads them fresh without paying attention-decay on a long
+            # history.
+            if looks_like_correction(chad.user_input):
+                requested_count = detect_requested_count(chad.user_input)
+                messages.append({
+                    "role": "system",
+                    "content": build_correction_nudge(
+                        chad.user_input,
+                        requested_count=requested_count,
+                    ),
+                })
+                logger.info(
+                    "Correction detected in user_input; injected nudge "
+                    "(requested_count=%s).",
+                    requested_count,
+                )
+
             messages.append({"role": "user", "content": chad.user_input})
             tools_array = registry.openai_tools()
         except Exception:
@@ -387,9 +415,30 @@ async def on_message(message):
         response = None
         dedup_cache: dict[str, ToolResult] = {}
         last_round_signature: tuple | None = None
+        final_nudge_injected = False
         try:
             for _round in range(MAX_TOOL_ROUNDS):
                 is_last_round = (_round == MAX_TOOL_ROUNDS - 1)
+
+                # On the forced-text round, tell the model explicitly that
+                # no more tools are available. Without this nudge Sarvam
+                # sometimes narrates "I would call X but..." in the final
+                # text. Injected once, just before the last LLM turn.
+                if is_last_round and not final_nudge_injected and tools_array:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "NO MORE TOOL CALLS. तपाईंसँग अब कुनै tool उपलब्ध छैन। "
+                            "अहिलेसम्म collect भएको tool data प्रयोग गरेर अन्तिम "
+                            "नेपाली जवाफ लेख्नुहोस्। यदि डेटा पर्याप्त छैन भने, "
+                            "छोटो माफी माग्दै प्रयोगकर्तालाई के छैन र के गर्न "
+                            "सकिन्छ भनी बताउनुहोस् — कुनै काल्पनिक तथ्य नलेख्नुहोस्। "
+                            "स्रोत दिँदा केवल tool output मा देखिएका URL मात्र "
+                            "उद्धरण गर्नुहोस्।"
+                        ),
+                    })
+                    final_nudge_injected = True
+
                 response = await _run_llm_turn(
                     messages,
                     tools_array if (tools_array and not is_last_round) else None,
@@ -578,22 +627,31 @@ async def on_message(message):
 
         # ── Deterministic fixups + validator retry (non-fatal) ────
         if ai_response and llm_exc is None:
-            # Mechanical fixes first — cheap, don't need the LLM.
-            ai_response = normalize_digits(ai_response)
-            if tool_was_used:
-                ai_response = ensure_sources_line(ai_response, citation_urls)
-
             try:
-                issues = validate_answer(ai_response, tool_was_used=tool_was_used)
-                if issues:
+                # Check pre-fix state so we can distinguish "model was fine"
+                # from "fixups rescued it" in the log.
+                pre_issues = validate_answer(ai_response, tool_was_used=tool_was_used)
+
+                # Mechanical fixes first — cheap, don't need the LLM.
+                ai_response = normalize_digits(ai_response)
+                if tool_was_used:
+                    ai_response = ensure_sources_line(ai_response, citation_urls)
+
+                # Re-validate *after* fixups: if the only problems were
+                # ASCII digits and a missing स्रोत line, we've just solved
+                # them without burning a Sarvam call.
+                post_issues = validate_answer(ai_response, tool_was_used=tool_was_used)
+
+                if post_issues:
                     logger.info(
-                        "Validator issues after deterministic fixes: %s — retrying once.",
-                        issues,
+                        "Validator issues remain after deterministic fixes "
+                        "(pre=%s post=%s) — retrying with LLM once.",
+                        pre_issues, post_issues,
                     )
                     messages.append({"role": "assistant", "content": ai_response})
                     messages.append({
                         "role": "system",
-                        "content": build_fix_message(issues),
+                        "content": build_fix_message(post_issues),
                     })
                     retry_resp = await _run_llm_turn(
                         messages, tools_array=None, tool_choice=None,
@@ -602,7 +660,6 @@ async def on_message(message):
                         retry_resp.choices[0].message.content or ""
                     ) if retry_resp and getattr(retry_resp, "choices", None) else ""
                     if retry_content:
-                        # Apply the same deterministic fixes to the retry output.
                         retry_content = normalize_digits(retry_content)
                         if tool_was_used:
                             retry_content = ensure_sources_line(
@@ -610,6 +667,12 @@ async def on_message(message):
                             )
                         ai_response = retry_content
                         validator_retries = 1
+                elif pre_issues:
+                    logger.info(
+                        "Validator issues %s resolved by deterministic "
+                        "fixes alone — skipped LLM retry.",
+                        pre_issues,
+                    )
             except Exception:
                 logger.exception("Validator retry failed; keeping original answer")
 

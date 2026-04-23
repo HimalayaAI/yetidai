@@ -8,6 +8,79 @@ from typing import Any
 # Devanagari digits → ASCII (for dates written as "२०२६-०२-२८" or "फेब्रुअरी २८")
 _DEVANAGARI_DIGIT_MAP = str.maketrans("०१२३४५६७८९", "0123456789")
 
+
+# ── Intent constants (single source of truth) ─────────────────────
+# Re-used by retrieval_planner.resolve_route_plan() and the OSINT tool
+# schema to keep the enum aligned everywhere.
+ALLOWED_INTENTS: tuple[str, ...] = (
+    "general_news", "macro", "government", "debt", "parliament", "trading",
+)
+
+# Endpoint budget per turn. Even if the router returns 4 intents, we won't
+# fire more than this many NepalOSINT endpoints in one call — each endpoint
+# adds ~200-500 tokens to the tool result and latency to the turn. Priority
+# order below decides which ones survive when the cap bites.
+MAX_ENDPOINTS_PER_TURN = 5
+
+# Priority of task names when the endpoint cap is exceeded. Higher-priority
+# tasks are kept. Anything not listed gets priority 0 (dropped first).
+_TASK_PRIORITY: dict[str, int] = {
+    "debt_clock": 100,          # authoritative single-number data
+    "economy_snapshot": 95,     # authoritative macro data
+    "debt_search": 85,
+    "verbatim_summary": 80,
+    "parliament_bills": 80,
+    "govt_decisions": 75,
+    "announcements": 70,
+    "history": 65,              # user asked explicitly → respect it
+    "recent_news": 60,
+    "general_search": 55,
+    "trading_search": 55,
+    "embedding_search": 50,
+}
+
+
+# ── NEPSE ticker whitelist ────────────────────────────────────────
+# Used instead of `\b[A-Z]{2,6}\b` which false-matches USA, HIV, CEO, etc.
+# This is a curated subset of the ~220 NEPSE listings — covers the
+# commonly-asked commercial banks, dev banks, insurers, and hydro tickers.
+# Unknown tickers still route as trading when the query also mentions
+# share/stock/NEPSE/IPO (see is_trading logic below).
+_NEPSE_TICKERS: frozenset[str] = frozenset({
+    # Commercial banks
+    "NABIL", "NICA", "NIMB", "NMB", "HBL", "SBI", "EBL", "MBL", "SCB",
+    "KBL", "GBIME", "NBL", "SRBL", "SBL", "CZBIL", "CBBL", "BOKL", "MEGA",
+    "LBBL", "LSL", "PRVU", "ADBL",
+    # Development banks
+    "JBBL", "SADBL", "EDBL", "KSBBL", "SHINE", "SINDU", "LBL",
+    # Insurance (life + non-life)
+    "NLICL", "LICN", "NLG", "NLGF", "NICL", "PICL", "PRIN", "SICL", "SIC",
+    "SLIC", "SLICL", "UIC", "ALICL", "CLI", "EIC", "GILB", "HEI", "HGI",
+    "LEC", "SGIC", "IGI", "NLIC", "NIL",
+    # Hydropower
+    "UPPER", "API", "AHPC", "CHCL", "HPPL", "HPCL", "NHPC", "NHDL", "NYADI",
+    "RADHI", "RHPL", "SHPC", "SHIVM", "TRH", "TAMOR", "TVCL", "SSHL", "SPDL",
+    "SHEL", "RURU", "RAWA", "PHCL", "UNHPL", "USHEC", "BNHC", "BPCL", "CHHC",
+    "LECC", "NGPL", "PPCL", "PMHPL", "UMHL",
+    # Micro-finance / finance
+    "NFS", "RBCL", "RMDC", "ODBL", "SFCL", "CFCL", "GMFBS", "MSLB",
+    # Manufacturing / hotels / others
+    "NLO", "NTC", "NRIC", "BBC", "UNL", "NBB", "HDL", "BPL", "CIT", "SHL",
+    "OHL", "SHIVAM", "NRN", "HRL", "NICLBSL", "BOTM",
+})
+
+# ASCII acronyms that look ticker-shaped but aren't NEPSE. Explicit deny-list
+# so the router never misclassifies them as trading queries.
+_NON_TICKER_ACRONYMS: frozenset[str] = frozenset({
+    "USA", "UK", "EU", "UN", "WHO", "IMF", "WB", "ADB", "NRB", "PDMO",
+    "CEO", "CTO", "CFO", "COO", "MD", "AI", "IT", "ML", "BS", "AD",
+    "GDP", "CPI", "PMI", "IPO", "FDI", "VAT", "TDS", "PAN",  # handled in trading keywords anyway
+    "NEPAL", "INDIA", "CHINA", "USD", "NPR", "INR", "EUR", "JPY",
+    "SAARC", "BIMSTEC", "OECD", "OPEC", "NATO",
+    "FM", "PM", "DPM", "HM", "DM", "SP", "DG", "CDO",
+    "HIV", "AIDS", "TB", "COVID", "MOU", "POS", "ATM", "LPG",
+})
+
 # English month names → month index. Covers short + long + common Nepali
 # transliterations ("फेब्रुअरी", "मार्च"). Uses Gregorian months only —
 # Bikram Sambat (बैशाख, जेठ, etc.) is intentionally out of scope.
@@ -248,8 +321,36 @@ class RoutePlan:
     is_who_is: bool = False  # "who is X / को हुनुहुन्छ" identity query
 
 
+# ASCII keywords shorter than this use regex word-boundary matching
+# (`\bna\b`) instead of naive substring (`"na" in "nabil"`). Devanagari
+# keywords use substring matching regardless — Devanagari word
+# boundaries rarely coincide with the ones Python's \b recognises.
+_SHORT_KEYWORD_LEN = 4
+_WORD_BOUNDARY_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _word_pattern(word: str) -> "re.Pattern[str]":
+    pat = _WORD_BOUNDARY_CACHE.get(word)
+    if pat is None:
+        pat = re.compile(rf"\b{re.escape(word)}\b", flags=re.IGNORECASE)
+        _WORD_BOUNDARY_CACHE[word] = pat
+    return pat
+
+
+def _keyword_matches(text: str, keyword: str) -> bool:
+    """Short ASCII keyword → regex word boundary. Everything else → substring.
+
+    This prevents "na" (National Assembly) from false-matching inside
+    "NABIL", "Nepal", "name", etc., while still catching Devanagari
+    substrings where \\b is not meaningful.
+    """
+    if keyword.isascii() and len(keyword) <= _SHORT_KEYWORD_LEN:
+        return _word_pattern(keyword).search(text) is not None
+    return keyword in text
+
+
 def _contains_any(normalized_query: str, keywords: set[str]) -> bool:
-    return any(keyword in normalized_query for keyword in keywords)
+    return any(_keyword_matches(normalized_query, kw) for kw in keywords)
 
 
 def _normalize_digits(text: str) -> str:
@@ -348,6 +449,38 @@ def _extract_history_range(query: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+_TICKER_CANDIDATE_RE = re.compile(r"\b[A-Z]{2,6}\b")
+
+_TRADING_CONTEXT_WORDS: frozenset[str] = frozenset({
+    "nepse", "share", "shares", "stock", "stocks", "ipo", "dividend",
+    "bonus", "right share", "ticker", "listed",
+    "शेयर", "सेयर", "नेप्से", "हकप्रद", "बोनस", "लाभांश", "आईपिओ",
+})
+
+
+def _has_nepse_ticker(query: str, normalized: str) -> bool:
+    """Decide whether the query references a NEPSE ticker.
+
+    Replaces the old `\\b[A-Z]{2,6}\\b` regex which false-matched common
+    English acronyms like USA, HIV, CEO. Rule:
+        1. Extract uppercase tokens from the original-case query.
+        2. Drop any in `_NON_TICKER_ACRONYMS`.
+        3. Match if any remaining token is in `_NEPSE_TICKERS`, OR if the
+           normalized query also contains a trading-context word
+           (share/stock/nepse/ipo/…) — in that case we let unknown tickers
+           pass so a new listing doesn't get silently dropped.
+    """
+    candidates = [
+        t for t in _TICKER_CANDIDATE_RE.findall(query)
+        if t not in _NON_TICKER_ACRONYMS
+    ]
+    if not candidates:
+        return False
+    if any(t in _NEPSE_TICKERS for t in candidates):
+        return True
+    return any(word in normalized for word in _TRADING_CONTEXT_WORDS)
+
+
 def route_query(query: str) -> RoutePlan:
     normalized = query.lower().strip()
     intents: list[str] = []
@@ -358,7 +491,10 @@ def route_query(query: str) -> RoutePlan:
     is_government = _contains_any(normalized, GOVT_KEYWORDS)
     is_debt = _contains_any(normalized, DEBT_KEYWORDS)
     is_parliament = _contains_any(normalized, PARLIAMENT_KEYWORDS)
-    is_ticker_like = bool(re.search(r"\b[A-Z]{2,6}\b", query)) and not (is_macro or is_debt or is_parliament or is_government)
+    is_ticker_like = (
+        _has_nepse_ticker(query, normalized)
+        and not (is_macro or is_debt or is_parliament or is_government)
+    )
     is_trading = _contains_any(normalized, TRADING_KEYWORDS) or is_ticker_like
     is_general_news = _contains_any(normalized, GENERAL_KEYWORDS) or has_romanized_general
     is_who_is = _contains_any(normalized, WHO_IS_KEYWORDS)
@@ -414,6 +550,97 @@ async def _safe_fetch(name: str, coroutine: Any) -> tuple[str, Any, str | None]:
         return name, None, f"{type(exc).__name__}: {exc}"
 
 
+def plan_from_intent(
+    intent: str | None,
+    query: str,
+    *,
+    is_who_is: bool | None = None,
+) -> RoutePlan | None:
+    """Build a RoutePlan directly from a caller-supplied intent.
+
+    Returns None if `intent` is not a recognised value — the caller should
+    fall back to the keyword-based `route_query` / LLM planner.
+
+    Accepts the six `ALLOWED_INTENTS` values plus two shortcuts:
+      * "who_is"  → identity lookup (semantic + unified search).
+      * "history" → force history fetch using dates extracted from `query`.
+
+    The caller (the OSINT tool handler) uses this to honour an explicit
+    `intent` argument from Sarvam without burning a planner-LLM round-trip.
+    """
+    if not intent:
+        return None
+    intent_norm = intent.strip().lower()
+    start_date, end_date = _extract_history_range(query)
+
+    if intent_norm == "who_is":
+        return RoutePlan(
+            use_nepalosint=True,
+            intents=["general_news"],
+            wants_history=False,
+            history_start_date=None,
+            history_end_date=None,
+            history_category=None,
+            is_who_is=True,
+        )
+
+    if intent_norm == "history":
+        # History without a date range is meaningless — fall back.
+        if not (start_date and end_date):
+            return None
+        return RoutePlan(
+            use_nepalosint=True,
+            intents=["general_news"],
+            wants_history=True,
+            history_start_date=start_date,
+            history_end_date=end_date,
+            history_category=None,
+            is_who_is=False,
+        )
+
+    if intent_norm not in ALLOWED_INTENTS:
+        return None
+
+    # Intent→history-category mapping matches route_query().
+    if intent_norm in ("macro", "debt", "trading"):
+        history_category = "economic"
+    elif intent_norm in ("government", "parliament"):
+        history_category = "political"
+    else:
+        history_category = None
+
+    return RoutePlan(
+        use_nepalosint=True,
+        intents=[intent_norm],
+        wants_history=bool(start_date and end_date),
+        history_start_date=start_date,
+        history_end_date=end_date,
+        history_category=history_category,
+        is_who_is=bool(is_who_is),
+    )
+
+
+def _apply_endpoint_cap(
+    tasks: dict[str, Any],
+    *,
+    cap: int = MAX_ENDPOINTS_PER_TURN,
+) -> dict[str, Any]:
+    """Trim the task dict to `cap` entries using `_TASK_PRIORITY`.
+
+    Deterministic: ties broken by insertion order (dict preserves it in
+    Python 3.7+), so tests stay stable. No-op when len(tasks) <= cap.
+    """
+    if len(tasks) <= cap:
+        return tasks
+    ordered = sorted(
+        tasks.items(),
+        key=lambda kv: (-_TASK_PRIORITY.get(kv[0], 0),),
+    )
+    kept = dict(ordered[:cap])
+    # Preserve original insertion order among the kept items for readability.
+    return {k: tasks[k] for k in tasks if k in kept}
+
+
 async def fetch_context_bundle(client: Any, query: str, plan: RoutePlan) -> dict[str, Any]:
     tasks: dict[str, Any] = {}
     max_items = getattr(client, "max_context_items", 8)
@@ -462,6 +689,11 @@ async def fetch_context_bundle(client: Any, query: str, plan: RoutePlan) -> dict
 
     if "general_news" in plan.intents and not has_specific_intent:
         tasks["recent_news"] = client.get_consolidated_recent(hours=24, limit=min(12, max_items))
+
+    # Endpoint cap: even with many intents, stay under the token/latency
+    # budget. Priority-ordered drop ensures we keep authoritative data
+    # (debt_clock, economy_snapshot) over broader search.
+    tasks = _apply_endpoint_cap(tasks)
 
     results = await asyncio.gather(*[_safe_fetch(name, task) for name, task in tasks.items()])
 

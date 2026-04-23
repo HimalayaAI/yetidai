@@ -6,10 +6,19 @@ import re
 import asyncio
 from typing import Any
 
-from tools.osint.context_router import RoutePlan, route_query
+from tools.osint.context_router import (
+    ALLOWED_INTENTS as _ROUTER_ALLOWED_INTENTS,
+    RoutePlan,
+    plan_from_intent,
+    route_query,
+)
 
 
-ALLOWED_INTENTS = {"general_news", "macro", "government", "debt", "parliament", "trading"}
+# Accept both the canonical six plus the two shortcuts the OSINT tool
+# exposes directly to the LLM (`who_is`, `history`). `plan_from_intent`
+# validates and materialises those into a RoutePlan.
+ALLOWED_INTENTS = set(_ROUTER_ALLOWED_INTENTS)
+HINTED_INTENT_VALUES = ALLOWED_INTENTS | {"who_is", "history"}
 
 FOLLOW_UP_MARKERS = (
     "यसले",
@@ -29,6 +38,71 @@ FOLLOW_UP_MARKERS = (
     "effect",
     "impact",
 )
+
+
+# Small-talk / greeting markers. When a query matches and doesn't name a
+# Nepal entity, we short-circuit to "no OSINT needed" so simple chats
+# like "k xa" / "halkhabar" don't waste an endpoint fan-out.
+#
+# The observed failure mode: user says "tapai ko halkhabar" (what's up).
+# The word "khabar" literally means "news", so the keyword router would
+# happily classify it as general_news and burn 1-2 OSINT calls returning
+# data nobody wanted. This filter fixes that.
+_SMALLTALK_MARKERS: tuple[str, ...] = (
+    # Devanagari greetings / small-talk
+    "नमस्ते", "नमस्कार", "के छ", "के छौ", "के गर्दै",
+    # Romanized Nepali
+    "k xa", "k cha", "ke xa", "ke cha", "halkhabar", "halchal",
+    "ke garne", "ke garnu", "ke garera", "sanchai",
+    "kasto xa", "kasto chha", "kasto cha",
+    # English greetings
+    "hi", "hey", "hello", "yo", "sup", "what's up", "whats up", "wassup",
+    "howdy", "good morning", "good evening",
+    # Identity probes
+    "who are you", "तिमी को", "तपाईं को", "tapai ko ho", "tapai k ho",
+)
+
+# Tokens that clearly indicate a Nepal-specific request even inside a
+# short message — if any of these appear, we do NOT short-circuit.
+_NEPAL_ENTITY_HINTS: tuple[str, ...] = (
+    "nepal", "नेपाल", "nrb", "nepse", "pdmo", "kathmandu", "काठमाडौं",
+    "parliament", "संसद", "cabinet", "मन्त्रिपरिषद्", "minister", "मन्त्री",
+    "inflation", "मुद्रास्फीति", "remittance", "रेमिट्यान्स",
+    "ipo", "share", "शेयर", "सेयर", "pm", "प्रधानमन्त्री",
+)
+
+
+_SHORT_MARKER_LEN = 4
+_SMALLTALK_WORD_CACHE: dict[str, "re.Pattern[str]"] = {}
+
+
+def _marker_matches(text: str, marker: str) -> bool:
+    """Word-boundary match for short ASCII markers (so "hi" doesn't match
+    inside "this"), substring for longer strings and Devanagari."""
+    if marker.isascii() and len(marker) <= _SHORT_MARKER_LEN:
+        pat = _SMALLTALK_WORD_CACHE.get(marker)
+        if pat is None:
+            pat = re.compile(rf"\b{re.escape(marker)}\b", flags=re.IGNORECASE)
+            _SMALLTALK_WORD_CACHE[marker] = pat
+        return pat.search(text) is not None
+    return marker in text
+
+
+def _is_smalltalk(query: str) -> bool:
+    """True when the query reads like greeting / chit-chat and does NOT
+    name a Nepal entity that needs OSINT."""
+    if not query:
+        return False
+    normalized = query.lower().strip()
+    # Trivially short — almost certainly small talk.
+    if len(normalized) <= 2:
+        return True
+    # Long messages are unlikely to be pure small talk.
+    if len(normalized.split()) > 6:
+        return False
+    if any(_marker_matches(normalized, hint) for hint in _NEPAL_ENTITY_HINTS):
+        return False
+    return any(_marker_matches(normalized, marker) for marker in _SMALLTALK_MARKERS)
 
 
 def _is_ambiguous(query: str, base_plan: RoutePlan) -> bool:
@@ -110,7 +184,41 @@ async def resolve_route_plan(
     llm_client: Any,
     query: str,
     previous_messages: list[Any] | None = None,
+    *,
+    hinted_intent: str | None = None,
 ) -> RoutePlan:
+    """Decide which NepalOSINT endpoints to hit for `query`.
+
+    Decision order:
+      1. `hinted_intent` — if the LLM passed an explicit enum value via the
+         tool arguments, honour it and skip the planner round-trip entirely.
+         This is the fast path: 0 extra LLM calls.
+      2. `route_query` keyword rules — deterministic, local, 0 LLM calls.
+         Used when the intent is unambiguous from keywords alone.
+      3. LLM planner (Sarvam) — only for ambiguous short queries or
+         multi-domain queries. One extra completion call, ~1.5 s budget,
+         with fall-through to the keyword base plan on any failure.
+
+    Parameters
+    ----------
+    hinted_intent : str, optional
+        One of `ALLOWED_INTENTS` or the shortcuts `who_is` / `history`.
+        Typically supplied by the OSINT tool from the `intent` tool
+        parameter. Invalid values are silently ignored (fall through to
+        keyword path) so a hallucinated enum value doesn't break routing.
+    """
+    # Fast path — LLM already told us what it wants.
+    if hinted_intent:
+        hinted_plan = plan_from_intent(hinted_intent, query)
+        if hinted_plan is not None:
+            return hinted_plan
+
+    # Small-talk short-circuit: for greetings / chit-chat with no Nepal
+    # entity in sight, return a plan that skips OSINT entirely. Saves the
+    # planner round-trip and the endpoint fan-out.
+    if _is_smalltalk(query):
+        return RoutePlan(use_nepalosint=False)
+
     base_plan = route_query(query)
     if not _is_ambiguous(query, base_plan):
         return base_plan

@@ -1,8 +1,30 @@
+"""
+tools/search/plugin.py — general-purpose web search + page extraction.
+
+Design:
+  * SERP layer: DuckDuckGo HTML (no API key, no rate-limit token).
+  * Page-read layer: fetch top N result pages in parallel (httpx async),
+    extract main text with a BeautifulSoup heuristic, truncate to a per-
+    page budget so the tool result fits Sarvam's context window.
+  * Token budget: MAX_TOTAL_CHARS bounds the whole tool message.
+  * Fail-soft: a slow/403/404 result is replaced by its DDG snippet, not
+    dropped — the LLM still sees the URL and a usable summary.
+
+This upgrade is the main thing that keeps Yeti off its training cutoff:
+the old plugin returned 5 one-line snippets, which is barely more than
+"here is a URL, trust yourself". Reading real page text means the final
+Nepali answer can quote specific facts.
+"""
+from __future__ import annotations
+
 import asyncio
-import urllib.request
+import logging
+import re
 import urllib.parse
+from typing import Any
+
+import httpx
 from bs4 import BeautifulSoup
-from typing import Dict, Any
 
 from core.tool_contracts import (
     ToolCategory,
@@ -13,28 +35,78 @@ from core.tool_contracts import (
 )
 from core.tool_registry import get_registry
 
+logger = logging.getLogger("yetidai.search")
+
+
+# ── Budgets ───────────────────────────────────────────────────────
+# Tuned so a single internet_search call fits comfortably inside
+# Sarvam's prompt budget even when combined with a parallel OSINT call.
+MAX_RESULTS = 5          # DDG results requested
+MAX_READ_PAGES = 3       # how many pages we actually fetch+extract
+MAX_PAGE_CHARS = 1400    # per-page extracted-text cap
+MAX_TOTAL_CHARS = 4800   # whole-tool-message cap
+
+PAGE_TIMEOUT_SECONDS = 6.0
+SERP_TIMEOUT_SECONDS = 8.0
+
+_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+)
+
+# HTML elements that never contain useful page content. Dropped before
+# text extraction so nav/cookie banners don't eat the char budget.
+_NOISE_SELECTORS = (
+    "script", "style", "nav", "footer", "aside", "form",
+    "noscript", "iframe", "svg", "button",
+)
+
+# Rough priority for text containers. First match wins per page.
+_MAIN_SELECTORS = (
+    "article",
+    "main",
+    "[role=main]",
+    "div#content",
+    "div.content",
+    "div.article",
+    "div.post",
+    "div.entry-content",
+    "div.story",
+    "div.news",
+)
+
+
 SEARCH_SPEC = ToolSpec(
     tool_id="search.internet",
     name="internet_search",
     description=(
-        "FALLBACK tool — general-purpose DuckDuckGo web search. Use this ONLY "
-        "when the question is clearly NOT about Nepal, OR when "
-        "get_nepal_live_context already ran and returned no useful data.\n\n"
+        "Live web search + page reading. Use for anything that depends on "
+        "real-world information, since your training data is stale.\n\n"
+        "WHAT IT DOES:\n"
+        "  1. Runs a DuckDuckGo query for `query`.\n"
+        "  2. Fetches the top 3 result pages and extracts their main "
+        "article text.\n"
+        "  3. Returns a compact bundle: for each result, the URL, a DDG "
+        "snippet, and up to ~1.4 KB of extracted page text.\n\n"
         "USE FOR:\n"
-        "  • Non-Nepal people (foreign heads of state, global CEOs, "
-        "international celebrities, historical figures).\n"
-        "  • World facts & trivia (capitals, sports results, scientific "
-        "constants, book/movie info).\n"
-        "  • Recent non-Nepal events or products.\n\n"
-        "DO NOT USE FOR (use get_nepal_live_context instead):\n"
-        "  • Nepal ministers, PM, officials — NepalOSINT tracks them live.\n"
-        "  • Nepal macro data (inflation, remittance, reserves, trade).\n"
-        "  • NEPSE, stocks, IPOs, dividends.\n"
-        "  • Public debt, parliament bills, government decisions.\n"
-        "  • Nepal news (current or historical).\n\n"
-        "OUTPUT: up to 5 English snippets with source URLs. You MUST "
-        "summarize / translate these into Nepali before replying to the user. "
-        "Never paste raw English into the final answer."
+        "  • Non-Nepal topics (world news, foreign leaders, sports, "
+        "science, product info).\n"
+        "  • Fact-checking a recent claim against primary sources.\n"
+        "  • Reading up-to-date documentation, release notes, changelogs.\n"
+        "  • When `get_nepal_live_context` returned nothing useful.\n\n"
+        "DO NOT USE FOR:\n"
+        "  • Nepal public information — `get_nepal_live_context` has "
+        "better coverage (NRB, NEPSE, cabinet, parliament).\n"
+        "  • Following a known URL — use `fetch_url` instead, it's "
+        "faster and doesn't burn a SERP query.\n"
+        "  • Analysing a GitHub repo — use `analyze_github_repo`.\n\n"
+        "QUERY TIPS:\n"
+        "  • English works best on DDG.\n"
+        "  • Include the current year for time-sensitive queries.\n"
+        "  • Quote multi-word names or exact phrases.\n\n"
+        "OUTPUT: English/multilingual raw text. You MUST summarise / "
+        "translate into Nepali in the final answer — never paste raw "
+        "English to the user. Cite at least one URL with a `स्रोत:` line."
     ),
     category=ToolCategory.UTILITY,
     parameters=[
@@ -42,80 +114,223 @@ SEARCH_SPEC = ToolSpec(
             name="query",
             type="string",
             description=(
-                "Concise English search query (DDG works best in English). "
-                "Include the current year when asking about current people or "
-                "events (e.g. '… 2026'). Quote multi-word names for precision."
+                "Concise English search query. Include year for recency, "
+                "quote exact names/phrases."
             ),
             required=True,
             examples=[
-                "UEFA Champions League 2025 winner",
-                "current president of India 2026",
+                "UEFA Champions League 2026 winner",
+                "\"Llama 4\" release date",
                 "Mount Everest height meters",
-                "OpenAI GPT release 2026",
+                "current president of India 2026",
             ],
-        )
+        ),
+        ToolParam(
+            name="read_pages",
+            type="integer",
+            description=(
+                f"How many of the top DDG results to fetch and extract. "
+                f"Default {MAX_READ_PAGES}. Set to 0 for snippets-only "
+                f"(fast but shallow). Capped at {MAX_RESULTS}."
+            ),
+            required=False,
+        ),
     ],
+    timeout_seconds=25.0,
 )
 
-def _run_search_sync(query: str) -> list[dict]:
-    """Run search synchronously via DDG HTML."""
-    try:
-        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-        req = urllib.request.Request(
-            url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html = response.read()
-        
-        soup = BeautifulSoup(html, 'html.parser')
-        results = []
-        for result in soup.find_all('div', class_='result'):
-            title_node = result.find('a', class_='result__url')
-            snippet_node = result.find('a', class_='result__snippet')
-            if title_node and snippet_node:
-                results.append({
-                    'title': title_node.text.strip(),
-                    'body': snippet_node.text.strip(),
-                    'href': title_node.get('href', '')
-                })
-            if len(results) >= 5:
-                break
-        return results
-    except Exception as e:
-        print(f"Search error: {e}")
-        return []
 
-async def handle_search(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
-    """Execute search and return results."""
+# ── SERP (DuckDuckGo HTML) ────────────────────────────────────────
+
+def _clean_ddg_href(raw: str) -> str:
+    """DDG wraps result URLs in `/l/?uddg=<encoded>`. Unwrap when we see it."""
+    if raw.startswith("/l/?") or raw.startswith("//duckduckgo.com/l/?"):
+        parsed = urllib.parse.urlparse(raw)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "uddg" in qs and qs["uddg"]:
+            return urllib.parse.unquote(qs["uddg"][0])
+    return raw
+
+
+async def _ddg_search(client: httpx.AsyncClient, query: str) -> list[dict[str, str]]:
+    """Return up to MAX_RESULTS DDG results as dicts {title, snippet, href}."""
+    url = "https://html.duckduckgo.com/html/"
+    response = await client.post(
+        url,
+        data={"q": query},
+        headers={"User-Agent": _UA},
+        timeout=SERP_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    out: list[dict[str, str]] = []
+    for node in soup.find_all("div", class_="result"):
+        title_node = node.find("a", class_="result__a")
+        snippet_node = node.find("a", class_="result__snippet") or node.find("div", class_="result__snippet")
+        href_node = node.find("a", class_="result__url") or title_node
+        if not title_node or not href_node:
+            continue
+        href = _clean_ddg_href(href_node.get("href", "").strip())
+        if not href or not href.startswith("http"):
+            continue
+        out.append({
+            "title": title_node.get_text(" ", strip=True),
+            "snippet": snippet_node.get_text(" ", strip=True) if snippet_node else "",
+            "href": href,
+        })
+        if len(out) >= MAX_RESULTS:
+            break
+    return out
+
+
+# ── Page extraction ───────────────────────────────────────────────
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _extract_main_text(html: str, *, cap: int = MAX_PAGE_CHARS) -> str:
+    """Cheap readability-ish extractor.
+
+    Strategy:
+      1. Drop obviously non-content tags (scripts, nav, forms).
+      2. Look for a main-content container via a prioritised selector list.
+         Fall back to <body> if none match.
+      3. Concatenate block text, collapse whitespace, truncate to `cap`.
+
+    Not as good as python-readability, but has no extra dependency and is
+    deterministic — fine for a 1-2 KB snippet that the LLM will re-read.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for sel in _NOISE_SELECTORS:
+        for tag in soup.find_all(sel):
+            tag.decompose()
+
+    container = None
+    for selector in _MAIN_SELECTORS:
+        container = soup.select_one(selector)
+        if container is not None:
+            break
+    if container is None:
+        container = soup.body or soup
+
+    text = container.get_text(" ", strip=True)
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    if len(text) <= cap:
+        return text
+    # Truncate at last sentence boundary inside the cap window.
+    window = text[:cap]
+    for sep in (". ", "। ", "! ", "? "):
+        idx = window.rfind(sep)
+        if idx > cap // 2:
+            return window[: idx + 1].strip() + " …"
+    return window.rstrip() + " …"
+
+
+async def _fetch_and_extract(
+    client: httpx.AsyncClient,
+    result: dict[str, str],
+) -> dict[str, str]:
+    """Return the original result dict augmented with `body` (extracted text).
+
+    On any failure the `body` falls back to the DDG `snippet` so downstream
+    still has *something* to cite. Errors are logged but not raised.
+    """
+    href = result["href"]
+    try:
+        resp = await client.get(
+            href,
+            headers={"User-Agent": _UA, "Accept": "text/html"},
+            timeout=PAGE_TIMEOUT_SECONDS,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        ctype = resp.headers.get("content-type", "")
+        if "html" not in ctype.lower():
+            raise ValueError(f"non-html content-type: {ctype}")
+        body = _extract_main_text(resp.text)
+        if not body:
+            body = result.get("snippet", "") or "(no extractable text)"
+    except Exception as exc:
+        logger.info("fetch_and_extract failed for %s: %s", href, exc)
+        body = result.get("snippet", "") or "(fetch failed)"
+    return {**result, "body": body}
+
+
+# ── Handler ───────────────────────────────────────────────────────
+
+def _format_results(results: list[dict[str, str]]) -> str:
+    """Render fetched results into a compact, citable block."""
+    lines: list[str] = []
+    used = 0
+    for idx, r in enumerate(results, start=1):
+        title = r.get("title", "").strip() or "(untitled)"
+        body = r.get("body") or r.get("snippet") or ""
+        href = r.get("href", "")
+        block = f"[{idx}] {title}\n{body}\nSource: {href}"
+        if used + len(block) + 2 > MAX_TOTAL_CHARS:
+            block = block[: max(0, MAX_TOTAL_CHARS - used - 20)].rstrip() + " …"
+            lines.append(block)
+            break
+        lines.append(block)
+        used += len(block) + 2
+    return "Internet Search Results:\n\n" + "\n\n".join(lines)
+
+
+async def handle_search(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResult:
     query = arguments.get("query")
-    if not query:
+    if not query or not isinstance(query, str):
         return ToolResult(tool_id=SEARCH_SPEC.tool_id, success=False, error="Missing query")
 
     try:
-        raw_results = await asyncio.to_thread(_run_search_sync, query)
-        
-        if not raw_results:
-             return ToolResult(
-                tool_id=SEARCH_SPEC.tool_id,
-                success=True,
-                content="No search results were found for this query."
-            )
+        read_pages = int(arguments.get("read_pages", MAX_READ_PAGES))
+    except (TypeError, ValueError):
+        read_pages = MAX_READ_PAGES
+    read_pages = max(0, min(read_pages, MAX_RESULTS))
 
-        formatted_results = []
-        for r in raw_results:
-            formatted_results.append(f"Snippet: {r.get('body')}\nSource: {r.get('href')}")
-            
-        content = "Internet Search Results:\n\n" + "\n\n".join(formatted_results)
-        
+    try:
+        async with httpx.AsyncClient(
+            http2=False,
+            timeout=PAGE_TIMEOUT_SECONDS,
+        ) as client:
+            serp = await _ddg_search(client, query)
+            if not serp:
+                return ToolResult(
+                    tool_id=SEARCH_SPEC.tool_id,
+                    success=True,
+                    content="No search results were found for this query.",
+                )
+
+            if read_pages == 0:
+                enriched = [{**r, "body": r.get("snippet", "")} for r in serp]
+            else:
+                fetched = await asyncio.gather(
+                    *[_fetch_and_extract(client, r) for r in serp[:read_pages]],
+                    return_exceptions=False,
+                )
+                enriched = list(fetched) + [
+                    {**r, "body": r.get("snippet", "")}
+                    for r in serp[read_pages:]
+                ]
+
+        content = _format_results(enriched)
+        meta = {
+            "serp_count": len(serp),
+            "pages_read": min(read_pages, len(serp)),
+        }
         return ToolResult(
             tool_id=SEARCH_SPEC.tool_id,
             success=True,
-            content=content
+            content=content,
+            meta=meta,
         )
-    except Exception as e:
-        return ToolResult(tool_id=SEARCH_SPEC.tool_id, success=False, error=str(e))
+    except Exception as exc:
+        logger.exception("internet_search failed")
+        return ToolResult(
+            tool_id=SEARCH_SPEC.tool_id,
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
 
 def register() -> None:
-    """Register the search tool with the global registry."""
     get_registry().register(SEARCH_SPEC, handle_search)

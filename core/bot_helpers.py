@@ -197,12 +197,55 @@ def normalize_digits(text: str) -> str:
 TOOL_ERROR_MARKER = "[TOOL_ERROR]"
 TOOL_TIMEOUT_MARKER = "[TOOL_TIMEOUT]"
 TOOL_DEDUP_MARKER = "[TOOL_DEDUP_HIT]"
+# Emitted by the OSINT plugin when it detects stale data for a recency
+# query. Treated like the error/timeout markers so `is_real_tool_content`
+# returns False — the validator would otherwise demand a citation and
+# the model could cite a 2022 story as "today's news".
+TOOL_STALE_MARKER = "[STALE_DATA]"
 
 _TOOL_STATUS_MARKERS: tuple[str, ...] = (
     TOOL_ERROR_MARKER,
     TOOL_TIMEOUT_MARKER,
     TOOL_DEDUP_MARKER,
+    TOOL_STALE_MARKER,
 )
+
+
+# Keys stripped from tool_call args before hashing. The model often varies
+# these trivially between rounds (limit=8 vs limit=10, hours=24 vs hours=48,
+# read_pages=2 vs read_pages=3) — treating those as distinct calls defeats
+# the dedup cache. Tunable per-tool if a plugin genuinely distinguishes
+# on these values (none currently do).
+_DEDUP_NOISE_KEYS: frozenset[str] = frozenset({
+    "limit", "max_items", "top_k", "page", "offset", "hours",
+    "read_pages", "min_similarity", "dedupe",
+})
+
+
+def canonical_tool_args(args: dict[str, Any] | None) -> dict[str, Any]:
+    """Drop pagination/noise keys + lowercase string values so near-
+    identical calls collapse to the same dedup signature.
+
+    Example:
+        {"query": "NEPSE", "limit": 8}  →  {"query": "nepse"}
+        {"query": "nepse", "limit": 10} →  {"query": "nepse"}
+    Both hash to the same key and the second call replays the cached
+    result instead of hitting the plugin again.
+    """
+    if not args:
+        return {}
+    cleaned: dict[str, Any] = {}
+    for key, value in args.items():
+        if not isinstance(key, str) or key in _DEDUP_NOISE_KEYS:
+            continue
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                continue
+            cleaned[key] = stripped.lower()
+        else:
+            cleaned[key] = value
+    return cleaned
 
 
 def hash_tool_call(name: str, args: dict[str, Any]) -> str:
@@ -210,12 +253,14 @@ def hash_tool_call(name: str, args: dict[str, Any]) -> str:
 
     Used for in-turn dedup: if the model emits the same (name, args) pair
     across rounds we reuse the cached result and annotate the tool message
-    so the model notices it's looping.
+    so the model notices it's looping. `canonical_tool_args` normalises
+    pagination-y keys so trivial variations still collide.
     """
+    canonical_args = canonical_tool_args(args)
     try:
-        canonical = json.dumps(args or {}, sort_keys=True, ensure_ascii=False)
+        canonical = json.dumps(canonical_args, sort_keys=True, ensure_ascii=False)
     except (TypeError, ValueError):
-        canonical = repr(args)
+        canonical = repr(canonical_args)
     digest = hashlib.sha256(f"{name}|{canonical}".encode("utf-8")).hexdigest()
     return digest[:16]
 
@@ -264,6 +309,91 @@ def is_real_tool_content(result: Any) -> bool:
     if not content or not content.strip():
         return False
     return not is_tool_status_marker(content)
+
+
+# ── Correction / count-intent detection ──────────────────────────
+#
+# Observed in production: user says "aja ko 30 khabar" → bot lists 30
+# news *portals*. User replies "haina, samachar portal bahenyko haina"
+# (not portals) → bot repeats the same wrong list. These helpers let
+# bot.py inject a corrective system message before the LLM turn.
+
+_CORRECTION_MARKERS: tuple[str, ...] = (
+    # Devanagari
+    "होइन", "गलत", "त्यो होइन", "फरक", "फेरि पढ",
+    # Romanised Nepali
+    "haina", "hoina", "bahenyko haina", "bhaneko haina",
+    "purano", "maile bhaneko", "galat", "milaunu",
+    # English
+    "not that", "wrong answer", "that's wrong", "that is not",
+    "you misunderstood", "re-read", "i asked", "i said",
+    "different from", "you didn't understand",
+)
+
+# Rough "N items requested" detector. Handles Devanagari + ASCII digits
+# and common English number words. Returns None if nothing obvious.
+_COUNT_RE = re.compile(
+    r"(?:^|\s)(\d{1,3}|[०-९]{1,3})\s*(?:वटा|ota|wata|items?|news|stories|headlines?)",
+    re.IGNORECASE,
+)
+_DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+
+
+def looks_like_correction(user_text: str | None) -> bool:
+    """True when the user's latest message reads like a correction of our
+    previous reply ("haina", "you misunderstood", "purano khabar", …)."""
+    if not user_text:
+        return False
+    lower = user_text.lower()
+    return any(marker in lower for marker in _CORRECTION_MARKERS)
+
+
+def detect_requested_count(user_text: str | None) -> int | None:
+    """Extract an explicit 'N items' count from the user message.
+
+    Used to surface intent to the LLM: if the user asked for 30 and we
+    only have 5 real stories, it's better to say so than to pad with
+    duplicates (the transcript's "NepalKhabar, NepalKhabar, …" failure).
+    """
+    if not user_text:
+        return None
+    m = _COUNT_RE.search(user_text.translate(_DEVANAGARI_DIGITS))
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except ValueError:
+        return None
+    return n if 1 <= n <= 200 else None
+
+
+def build_correction_nudge(
+    user_text: str,
+    *,
+    requested_count: int | None = None,
+) -> str:
+    """System-message text to inject when we detect a user correction.
+
+    The goal is to break the "parrot the previous bad answer" loop. The
+    nudge is in Nepali to stay in-register and names the specific anti-
+    patterns we've seen (duplicate entries, wrong type of answer).
+    """
+    extra = ""
+    if requested_count:
+        extra = (
+            f"\nप्रयोगकर्ताले ठीक {requested_count} वटा माग्नुभएको छ। "
+            "यदि tool output मा {requested_count} वटा पर्याप्त छैनन् भने, "
+            "दोहोरो प्रविष्टि (duplicate entries) कहिल्यै नलेख्नुहोस् — "
+            "इमानदार भएर कति मात्र उपलब्ध छन् भन्नुहोस्।"
+        )
+    return (
+        "प्रयोगकर्ताले अघिल्लो जवाफ अस्वीकार गर्नुभएको छ। पहिले भन्दा फरक, "
+        "प्रयोगकर्ताको वास्तविक प्रश्न के हो ध्यान दिएर पुनः लेख्नुहोस्। "
+        "अघिल्लो जवाफ दोहोऱ्याउनुहुन्न। कुनै पनि entry दुई पटक नलेख्नुहोस् — "
+        "tool output मा जति unique items छन् त्यति नै देखाउनुहोस्। "
+        "यदि tool ले पर्याप्त डेटा दिएन भने, माफी मागेर खुलस्त भन्नुहोस्।"
+        f"{extra}"
+    )
 
 
 def ensure_sources_line(
