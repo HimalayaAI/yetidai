@@ -37,12 +37,6 @@ from tools.osint.freshness import assess_freshness
 # behind a stale citation.
 STALE_DATA_MARKER = "[STALE_DATA]"
 
-# Emitted when the upstream NepalOSINT cache itself is older than the
-# freshness threshold (dataset-wide staleness, not just per-payload).
-# Forces a web fallback AND instructs the LLM to tell the user in Nepali
-# that OSINT data is behind — so stale numbers don't leak as current.
-COVERAGE_GAP_MARKER = "[OSINT_COVERAGE_GAP]"
-
 
 import re as _re
 
@@ -251,34 +245,13 @@ async def handle_osint(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResul
         if freshness.get("stale"):
             age = freshness.get("age_days")
             newest = freshness.get("newest")
-            coverage_gap = bool(freshness.get("coverage_gap"))
-            gap_days = freshness.get("gap_days")
-            # Two distinct conditions share the same stale→fallback path
-            # but need different markers so the LLM can phrase the user-
-            # facing acknowledgement correctly:
-            #   - COVERAGE_GAP: upstream cache frozen past the threshold;
-            #     the entire dataset is behind. Tell the user and lean on
-            #     web. This is the P1/P3/P4 failure mode.
-            #   - STALE_DATA: per-payload age beyond threshold; may be
-            #     one feed lagging while others are current. Same action
-            #     (fallback) but softer narration.
-            if coverage_gap:
-                stale_header = (
-                    f"{COVERAGE_GAP_MARKER} NepalOSINT's upstream cache is "
-                    f"{gap_days} days behind (coverage ends around the "
-                    f"anchor date). DO NOT serve any number or date from "
-                    f"this payload as if it were current. Acknowledge the "
-                    f"gap in the final Nepali answer and use the "
-                    f"internet_search fallback as primary.\n\n"
-                )
-            else:
-                stale_header = (
-                    f"{STALE_DATA_MARKER} NepalOSINT's freshest story is "
-                    f"{age} days old ({newest}), but the user asked about a "
-                    f"current event. DO NOT present this as today's news — "
-                    f"say the data is stale and rely on the web-search "
-                    f"fallback that runs next.\n\n"
-                )
+            stale_header = (
+                f"{STALE_DATA_MARKER} NepalOSINT's freshest story is "
+                f"{age} days old ({newest}), but the user asked about a "
+                f"current event. DO NOT present this as today's news — "
+                f"say the data is stale and rely on the web-search "
+                f"fallback that runs next.\n\n"
+            )
             # Return a stale-flagged result and chain to internet_search.
             # The loop will surface the web result and the model can
             # decide which to cite.

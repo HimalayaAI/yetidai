@@ -86,7 +86,6 @@ def validate_answer(
     *,
     tool_was_used: bool,
     github_tool_was_used: bool = True,
-    citation_urls_len: int = 0,
     min_devanagari_chars: int = 15,
 ) -> list[str]:
     """Return a list of Nepali fix instructions. Empty list = all good.
@@ -95,11 +94,6 @@ def validate_answer(
     how to thread the flag preserve previous behavior. Pass False when
     no github tool ran this turn — the validator will then flag any
     `github.com/HimalayaAI/<suffix>` URL as an unverified fabrication.
-
-    `citation_urls_len` lets rule 3 fire on answers where URLs were
-    harvested from tool content even when `tool_was_used` stayed False
-    (e.g. error-marker results that still carried sources). Default 0
-    preserves legacy behavior for callers that don't pass it.
     """
     issues: list[str] = []
 
@@ -121,11 +115,8 @@ def validate_answer(
             "मुख्य जवाफ देवनागरी (नेपाली) मा लेखिएको छैन — पुनः नेपालीमा लेख्नुहोस्।"
         )
 
-    # (3) स्रोत: line required when tool output was available. Fires also
-    # when URLs were harvested (citation_urls_len > 0) — covers the case
-    # where is_real_tool_content kept tool_was_used False but the result
-    # still carried URLs worth citing.
-    if (tool_was_used or citation_urls_len > 0) and "स्रोत:" not in answer:
+    # (3) स्रोत: line required when tool output was available.
+    if tool_was_used and "स्रोत:" not in answer:
         issues.append("स्रोत: रेखा थप्नुहोस् (२–४ भरपर्दो स्रोत उद्धरण गर्नुहोस्)।")
 
     # (4) No long English paragraphs.

@@ -58,15 +58,11 @@ from core.tool_registry import get_registry
 from core.tool_contracts import ToolContext, ToolResult
 from core.output_validator import validate_answer, build_fix_message
 from core.request_log import log_turn
-from core.intent_classifier import (
-    classify_intent,
-    routing_hint_message,
-    should_force_tool_call,
-)
 from core.nepali_date import format_bs_ne, format_bs_iso
 from core.date_context import build_date_block
 from core.preflight import plan_preflight
 from core.bot_helpers import (
+    DISCORD_EMBED_FOOTER_LIMIT,
     DISCORD_MSG_LIMIT,
     GENERIC_TECH_ERROR,
     TOOL_DEDUP_MARKER,
@@ -151,22 +147,9 @@ async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
 
     Body chunks and the citations embed are sent independently: a failure to
     build or send the embed must not prevent the body from being delivered.
-
-    Deduplication: the embed's numbered fields are the canonical display
-    of sources. When the embed is shown, we strip the inline `स्रोत:`
-    block from the body — otherwise the user sees the same URLs twice
-    (once in the embed fields, again as markdown text below them), which
-    was a recurring cosmetic complaint from the live test run.
     """
-    body, _ = split_body_and_sources(answer)
-    # If the embed is going to render, ALWAYS strip the inline स्रोत:
-    # block from the body — citation_urls non-empty means the embed fires
-    # below. If citation_urls is empty, we keep the inline block (it may
-    # be the user's only source reference).
-    if citation_urls and body:
-        text = body
-    else:
-        text = answer
+    body, sources_line = split_body_and_sources(answer)
+    text = body if (citation_urls and body) else answer
 
     for chunk in chunk_for_discord(text, DISCORD_MSG_LIMIT):
         await channel.send(chunk)
@@ -178,9 +161,8 @@ async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
         embed = discord.Embed(title="स्रोत / Sources", color=0x2D72D2)
         for idx, url in enumerate(citation_urls[:5], start=1):
             embed.add_field(name=f"{idx}.", value=safe_field_value(url), inline=False)
-        # No footer: it previously echoed the inline स्रोत: markdown line,
-        # duplicating the numbered fields above. Fields are the single
-        # canonical view now.
+        if sources_line:
+            embed.set_footer(text=sources_line[:DISCORD_EMBED_FOOTER_LIMIT])
         await channel.send(embed=embed)
     except Exception:
         logger.exception("Failed to send citations embed (body already delivered)")
@@ -565,39 +547,6 @@ async def on_message(message):
             )
             return
 
-        # ── LLM intent pre-classifier ─────────────────────────────
-        # One fast Sarvam call, strict-JSON, to classify the user message
-        # BEFORE the main tool loop starts. Drives two decisions:
-        #   (a) injects a routing-hint system message so the main turn
-        #       sees the classifier's recommendation.
-        #   (b) upgrades the first round's tool_choice from "auto" to
-        #       "required" when confidence is high — prevents Sarvam from
-        #       silently skipping tools and drifting into training data.
-        #
-        # Fails open: on any classifier error, initial_tool_choice stays
-        # "auto" and the existing keyword/preflight path carries the turn.
-        initial_tool_choice: str = "auto"
-        classification: dict | None = None
-        try:
-            classification = await classify_intent(
-                llm_client, chad.user_input, model=LLM_MODEL,
-            )
-        except Exception:
-            logger.exception("intent_classifier raised — falling back to auto")
-            classification = None
-
-        if classification is not None:
-            messages.append(routing_hint_message(classification))
-            if should_force_tool_call(classification) and tools_array:
-                initial_tool_choice = "required"
-                logger.info(
-                    "Pre-classifier forcing tool_choice=required "
-                    "(bucket=%d, tools=%s, conf=%.2f)",
-                    classification["bucket"],
-                    classification["tools_needed"],
-                    classification["confidence"],
-                )
-
         # ── Tool-call loop ────────────────────────────────────────
         # On the final round we strip tools to force Sarvam to emit text,
         # eliminating the "ran out of rounds with empty ai_response" failure
@@ -631,40 +580,11 @@ async def on_message(message):
                     })
                     final_nudge_injected = True
 
-                # Round 0 may use "required" when the pre-classifier was
-                # confident a tool is needed; subsequent rounds fall back
-                # to "auto" so Sarvam can choose when/whether to compose
-                # further tool calls vs. emit the final answer.
-                if tools_array and not is_last_round:
-                    round_tool_choice = (
-                        initial_tool_choice if _round == 0 else "auto"
-                    )
-                else:
-                    round_tool_choice = None
-
-                try:
-                    response = await _run_llm_turn(
-                        messages,
-                        tools_array if (tools_array and not is_last_round) else None,
-                        tool_choice=round_tool_choice,
-                    )
-                except Exception as exc:
-                    # Some SDKs reject `tool_choice="required"`. Downgrade
-                    # to "auto" once and retry; the proactive forcing is
-                    # a best-effort upgrade, never a hard requirement.
-                    if round_tool_choice == "required":
-                        logger.info(
-                            "tool_choice=required rejected (%s) → "
-                            "retrying with auto",
-                            type(exc).__name__,
-                        )
-                        response = await _run_llm_turn(
-                            messages,
-                            tools_array if (tools_array and not is_last_round) else None,
-                            tool_choice="auto",
-                        )
-                    else:
-                        raise
+                response = await _run_llm_turn(
+                    messages,
+                    tools_array if (tools_array and not is_last_round) else None,
+                    tool_choice=("auto" if (tools_array and not is_last_round) else None),
+                )
 
                 if not response or not getattr(response, "choices", None):
                     break
@@ -1068,26 +988,17 @@ async def on_message(message):
                     for entry in tool_calls_log
                 )
 
-                # A tool result is "citation-worthy" if it yielded at least
-                # one URL, even when tool_was_used is False (error-marker /
-                # partial-content results set tool_was_used conservatively
-                # but can still carry real URLs). Without this, inline
-                # `स्रोत:` was skipped on every turn where citations only
-                # lived in citation_urls — the #1 bug from the live test.
-                have_citations = bool(citation_urls)
-
                 # Check pre-fix state so we can distinguish "model was fine"
                 # from "fixups rescued it" in the log.
                 pre_issues = validate_answer(
                     ai_response,
                     tool_was_used=tool_was_used,
                     github_tool_was_used=github_tool_was_used,
-                    citation_urls_len=len(citation_urls),
                 )
 
                 # Mechanical fixes first — cheap, don't need the LLM.
                 ai_response = normalize_digits(ai_response)
-                if tool_was_used or have_citations:
+                if tool_was_used:
                     ai_response = ensure_sources_line(ai_response, citation_urls)
                 # Shorten any bare URLs in the स्रोत: block to Discord-markdown
                 # links regardless of who wrote the block (model or helper).
@@ -1100,7 +1011,6 @@ async def on_message(message):
                     ai_response,
                     tool_was_used=tool_was_used,
                     github_tool_was_used=github_tool_was_used,
-                    citation_urls_len=len(citation_urls),
                 )
 
                 if post_issues:
@@ -1122,7 +1032,7 @@ async def on_message(message):
                     ) if retry_resp and getattr(retry_resp, "choices", None) else ""
                     if retry_content:
                         retry_content = normalize_digits(retry_content)
-                        if tool_was_used or have_citations:
+                        if tool_was_used:
                             retry_content = ensure_sources_line(
                                 retry_content, citation_urls,
                             )

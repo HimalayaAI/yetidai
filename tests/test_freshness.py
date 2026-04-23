@@ -52,65 +52,23 @@ class NewestDateTests(unittest.TestCase):
 
 
 class AssessFreshnessTests(unittest.TestCase):
-    # These tests pass coverage_until=None to isolate payload-age logic
-    # from the global OSINT_COVERAGE_UNTIL anchor. Separate tests below
-    # exercise coverage-gap behavior explicitly.
-
     def test_fresh_data_ok(self) -> None:
         fresh = (date.today() - timedelta(days=1)).isoformat()
-        info = assess_freshness(
-            "aja ko news", {"x": {"date": fresh}}, coverage_until=None,
-        )
+        info = assess_freshness("aja ko news", {"x": {"date": fresh}})
         self.assertFalse(info["stale"])
         self.assertTrue(info["required"])
 
     def test_stale_for_recency_query(self) -> None:
         stale = (date.today() - timedelta(days=RECENCY_THRESHOLD_DAYS + 2)).isoformat()
-        info = assess_freshness(
-            "aja ko news", {"x": {"date": stale}}, coverage_until=None,
-        )
+        info = assess_freshness("aja ko news", {"x": {"date": stale}})
         self.assertTrue(info["stale"])
 
-    def test_stale_regardless_of_recency_gate(self) -> None:
-        # Behavior change: staleness is now decoupled from recency keywords.
-        # A year-old payload is stale even for non-recency queries, so the
-        # fallback fires and the user doesn't get 2024 numbers served as
-        # current.
+    def test_not_stale_when_recency_not_requested(self) -> None:
+        # Same old data, but the user didn't ask about today — not stale.
         stale = (date.today() - timedelta(days=365)).isoformat()
-        info = assess_freshness(
-            "last year budget", {"x": {"date": stale}}, coverage_until=None,
-        )
-        self.assertTrue(info["stale"])
+        info = assess_freshness("last year budget", {"x": {"date": stale}})
+        self.assertFalse(info["stale"])
         self.assertFalse(info["required"])
-
-
-class CoverageGapTests(unittest.TestCase):
-    def test_coverage_gap_fires_on_fresh_payload(self) -> None:
-        # Payload is 1 day old (fresh), but upstream coverage anchor was
-        # 30 days ago — the whole dataset is behind, so stale + gap fire.
-        fresh = (date.today() - timedelta(days=1)).isoformat()
-        anchor = date.today() - timedelta(days=30)
-        info = assess_freshness(
-            "nepalko pm ko ho",
-            {"x": {"date": fresh}},
-            coverage_until=anchor,
-        )
-        self.assertTrue(info["coverage_gap"])
-        self.assertTrue(info["stale"])
-        self.assertEqual(info["gap_days"], 30)
-
-    def test_coverage_anchor_inside_threshold_no_gap(self) -> None:
-        # Anchor within threshold (2 days ago, threshold=3) → no gap.
-        anchor = date.today() - timedelta(days=2)
-        info = assess_freshness("anything", {}, coverage_until=anchor)
-        self.assertFalse(info["coverage_gap"])
-        self.assertFalse(info["stale"])
-
-    def test_coverage_disabled_with_none(self) -> None:
-        info = assess_freshness("aja", {}, coverage_until=None)
-        self.assertFalse(info["coverage_gap"])
-        self.assertFalse(info["stale"])
-        self.assertIsNone(info["gap_days"])
 
 
 if __name__ == "__main__":
