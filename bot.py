@@ -62,7 +62,6 @@ from core.nepali_date import format_bs_ne, format_bs_iso
 from core.date_context import build_date_block
 from core.preflight import plan_preflight
 from core.bot_helpers import (
-    DISCORD_EMBED_FOOTER_LIMIT,
     DISCORD_MSG_LIMIT,
     GENERIC_TECH_ERROR,
     TOOL_DEDUP_MARKER,
@@ -147,9 +146,18 @@ async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
 
     Body chunks and the citations embed are sent independently: a failure to
     build or send the embed must not prevent the body from being delivered.
+
+    Deduplication: the embed's numbered fields are the canonical display
+    of sources. When the embed is shown, we strip the inline `स्रोत:`
+    block from the body — otherwise the user sees the same URLs twice
+    (once in the embed fields, again as markdown text below them), which
+    was a recurring cosmetic complaint from the live test run.
     """
-    body, sources_line = split_body_and_sources(answer)
-    text = body if (citation_urls and body) else answer
+    body, _ = split_body_and_sources(answer)
+    if citation_urls and body:
+        text = body
+    else:
+        text = answer
 
     for chunk in chunk_for_discord(text, DISCORD_MSG_LIMIT):
         await channel.send(chunk)
@@ -161,8 +169,9 @@ async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
         embed = discord.Embed(title="स्रोत / Sources", color=0x2D72D2)
         for idx, url in enumerate(citation_urls[:5], start=1):
             embed.add_field(name=f"{idx}.", value=safe_field_value(url), inline=False)
-        if sources_line:
-            embed.set_footer(text=sources_line[:DISCORD_EMBED_FOOTER_LIMIT])
+        # No footer: it previously echoed the inline `स्रोत:` markdown line,
+        # duplicating the numbered fields above. Fields are the single
+        # canonical source view now.
         await channel.send(embed=embed)
     except Exception:
         logger.exception("Failed to send citations embed (body already delivered)")
@@ -988,17 +997,26 @@ async def on_message(message):
                     for entry in tool_calls_log
                 )
 
+                # A tool result is "citation-worthy" if it yielded at least
+                # one URL, even when tool_was_used is False (error-marker /
+                # partial-content results set tool_was_used conservatively
+                # but can still carry real URLs). Without this, inline
+                # `स्रोत:` was skipped on every turn where citations only
+                # lived in citation_urls — the #1 bug from the live test.
+                have_citations = bool(citation_urls)
+
                 # Check pre-fix state so we can distinguish "model was fine"
                 # from "fixups rescued it" in the log.
                 pre_issues = validate_answer(
                     ai_response,
                     tool_was_used=tool_was_used,
                     github_tool_was_used=github_tool_was_used,
+                    citation_urls_len=len(citation_urls),
                 )
 
                 # Mechanical fixes first — cheap, don't need the LLM.
                 ai_response = normalize_digits(ai_response)
-                if tool_was_used:
+                if tool_was_used or have_citations:
                     ai_response = ensure_sources_line(ai_response, citation_urls)
                 # Shorten any bare URLs in the स्रोत: block to Discord-markdown
                 # links regardless of who wrote the block (model or helper).
@@ -1011,6 +1029,7 @@ async def on_message(message):
                     ai_response,
                     tool_was_used=tool_was_used,
                     github_tool_was_used=github_tool_was_used,
+                    citation_urls_len=len(citation_urls),
                 )
 
                 if post_issues:
@@ -1032,7 +1051,7 @@ async def on_message(message):
                     ) if retry_resp and getattr(retry_resp, "choices", None) else ""
                     if retry_content:
                         retry_content = normalize_digits(retry_content)
-                        if tool_was_used:
+                        if tool_was_used or have_citations:
                             retry_content = ensure_sources_line(
                                 retry_content, citation_urls,
                             )
