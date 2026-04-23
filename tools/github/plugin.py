@@ -130,14 +130,21 @@ LIST_REPOS_SPEC = ToolSpec(
     tool_id="github.list_org_repos",
     name="list_github_repos",
     description=(
-        "List public repositories for a GitHub organization or user. "
-        f"Defaults to the official HARL org (`{DEFAULT_ORG}`). Call this "
-        "when the user asks for 'your repo / the code / HARL github / "
-        "सबै repo / कोड कहाँ छ / list of repos'. Returns name + URL + "
-        "short description for each repo, sorted by recent push.\n\n"
+        "List public repositories for ANY GitHub account (org or user). "
+        "Returns name + URL + short description per repo, sorted by recent "
+        "push.\n\n"
+        "USE FOR:\n"
+        f"  • HARL's own code — omit `org` (defaults to `{DEFAULT_ORG}`).\n"
+        "  • Any other account the user names or pastes — pass it as `org`. "
+        "Works for both orgs and users; the tool tries `/orgs/<x>/repos` "
+        "first and falls back to `/users/<x>/repos`, so you don't need to "
+        "know which type it is.\n"
+        "  • Profile URLs like `https://github.com/nlethetech` (no repo "
+        "segment) — extract the username and pass it as `org`.\n\n"
         "USE THIS — NEVER fabricate a `github.com/<org>/<repo>` URL from "
-        "memory. `github.com/HimalayaAI` is only the org index page; the "
-        "repos under it must come from this tool."
+        "memory. A bare `github.com/<name>` profile URL must be turned into "
+        "`list_github_repos(org=\"<name>\")`, not into prose that invents "
+        "a repo suffix."
     ),
     category=ToolCategory.UTILITY,
     parameters=[
@@ -145,12 +152,14 @@ LIST_REPOS_SPEC = ToolSpec(
             name="org",
             type="string",
             description=(
-                f"GitHub org or username. Defaults to `{DEFAULT_ORG}` when "
-                "omitted. Pass a different value only if the user "
-                "explicitly asks about another org."
+                "GitHub org or username to list. Accepts any valid account "
+                f"name, not just HARL. Defaults to `{DEFAULT_ORG}` when "
+                "omitted (for 'your repo / HARL github' queries). For any "
+                "other account the user mentions — by name or by profile "
+                "URL — pass that username here."
             ),
             required=False,
-            examples=[DEFAULT_ORG, "anthropics"],
+            examples=[DEFAULT_ORG, "anthropics", "nlethetech"],
         ),
     ],
     timeout_seconds=15.0,
