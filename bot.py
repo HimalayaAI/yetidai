@@ -71,6 +71,7 @@ from core.bot_helpers import (
     TOOL_TIMEOUT_MARKER,
     build_correction_nudge,
     build_force_tool_nudge,
+    build_tool_narration_nudge,
     chunk_for_discord,
     classify_llm_error,
     detect_fabricated_filenames,
@@ -83,6 +84,7 @@ from core.bot_helpers import (
     is_bot_apology,
     is_empty_promise,
     is_real_tool_content,
+    is_tool_narration,
     is_transient_llm_error,
     looks_like_correction,
     needs_tool_use,
@@ -766,6 +768,34 @@ async def on_message(message):
             # Extract final answer
             if response and getattr(response, "choices", None):
                 ai_response = response.choices[0].message.content or ""
+
+            # Tool-narration rescue (same-turn):
+            # Model used the tool but its final reply narrates the mechanics
+            # ("tool call सफल भयो / query process गरिँदैछ") instead of using
+            # the returned data. The tool output is already in `messages` —
+            # just ask the model to rewrite WITHOUT another tool call.
+            if tool_was_used and is_tool_narration(ai_response):
+                logger.info(
+                    "Tool-narration detected (turn=%s): %r — forcing rewrite.",
+                    turn_id, ai_response[:120],
+                )
+                messages.append({"role": "assistant", "content": ai_response})
+                messages.append({
+                    "role": "system",
+                    "content": build_tool_narration_nudge(),
+                })
+                try:
+                    rewrite_resp = await _run_llm_turn(
+                        messages, tools_array=None, tool_choice=None,
+                    )
+                except Exception:
+                    rewrite_resp = None
+                if rewrite_resp and getattr(rewrite_resp, "choices", None):
+                    rewrite_text = (
+                        rewrite_resp.choices[0].message.content or ""
+                    ).strip()
+                    if rewrite_text and not is_tool_narration(rewrite_text):
+                        ai_response = rewrite_text
 
             # Empty-promise rescue (same-turn):
             # 1. Pure empty promise ("म बताउँछु / I'll fetch") with no tool used

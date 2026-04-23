@@ -569,6 +569,71 @@ def build_force_tool_nudge(user_text: str) -> str:
     )
 
 
+# ── Tool-narration detector ───────────────────────────────────────
+#
+# Production failure (observed 2026-04-23): user asks "Nepal ko ahile ko
+# home minister ko ho". Tool runs and returns real data. But Yeti's final
+# reply is "get_nepal_live_context tool use गरेर query process गरिँदैछ।
+# Tool call सफल भयो।" — it narrates the MECHANICS instead of USING the
+# data to answer. `is_empty_promise` doesn't catch this (tool WAS used,
+# past-tense narration not future-tense promise). This is the guard.
+
+_TOOL_NARRATION_PATTERNS: tuple["re.Pattern[str]", ...] = (
+    # "tool call / tool use / tool invoke" as a noun phrase in the answer
+    re.compile(r"\btool[_\s]?call[s]?\b", re.IGNORECASE),
+    re.compile(r"\btool\s+(?:use|invoke|invocation|run)\b", re.IGNORECASE),
+    # "X tool use गरेर" — Devanagari wrapper around English "tool use"
+    re.compile(r"tool\s+(?:use|call)\s+गर", re.IGNORECASE),
+    # "query process गरिँदैछ / गरियो / गर्दैछु"
+    re.compile(r"\b(?:query|data|request|response)\s+(?:process|retrieve|fetch)",
+               re.IGNORECASE),
+    re.compile(r"process\s+गरि(?:न्छ|ँदैछ|एको|यो|ँदै)"),
+    re.compile(r"retrieve\s+गरि(?:न्छ|ँदैछ|एको|यो|ँदै)", re.IGNORECASE),
+    # "Tool call सफल भयो / असफल भयो"
+    re.compile(r"tool[_\s]?call[s]?\s+(?:सफल|असफल|भयो|गरियो)", re.IGNORECASE),
+)
+
+# Narration is always short. Long answers that happen to mention "tool"
+# as a legit English word are not narration.
+_TOOL_NARRATION_MAX_CHARS = 320
+
+
+def is_tool_narration(text: str | None) -> bool:
+    """Heuristic: is the reply a meta-narration of the tool mechanics?
+
+    Signals:
+      1. Reply is short (narrations are always one- or two-liner status lines).
+      2. Matches one of the tool-mechanics phrase patterns above.
+
+    NOT gated on `tool_was_used` — narrating a tool call is a bug whether
+    the tool actually ran or not. Paired with a rewrite retry in bot.py.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped or len(stripped) > _TOOL_NARRATION_MAX_CHARS:
+        return False
+    return any(pat.search(stripped) for pat in _TOOL_NARRATION_PATTERNS)
+
+
+def build_tool_narration_nudge() -> str:
+    """System message used to force a rewrite after a tool-narration reply.
+
+    Unlike `build_force_tool_nudge`, this does NOT ask for a new tool call —
+    the tool already ran and its output is in the message history. We just
+    need the model to USE that data and write the actual Nepali answer.
+    """
+    return (
+        "तपाईंको अघिल्लो जवाफले tool call को मेकानिकी मात्र वर्णन गर्‍यो "
+        "('tool call सफल भयो', 'query process गरिँदैछ' जस्ता वाक्य)। यो "
+        "bug हो — user लाई tool को status चाहिँदैन, प्रश्नको उत्तर चाहिन्छ। "
+        "Tool ले फर्काएको data (माथिको tool message मा छ) प्रयोग गरेर "
+        "प्रश्नको सिधा नेपाली उत्तर लेख्नुहोस् + स्रोत: रेखा। अन्तिम जवाफमा "
+        "'tool', 'tool call', 'query process', 'सफल भयो' जस्ता शब्द "
+        "नआओस्। कुनै नयाँ tool call नगर्नुहोस् — केवल जवाफ लेख्नुहोस्।"
+    )
+
+
 # ── Anti-hallucination for GitHub answers ────────────────────────
 #
 # Production failure: analyze_github_repo ran, returned the real tree,
