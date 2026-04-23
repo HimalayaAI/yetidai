@@ -59,6 +59,7 @@ from core.tool_contracts import ToolContext, ToolResult
 from core.output_validator import validate_answer, build_fix_message
 from core.request_log import log_turn
 from core.nepali_date import format_bs_ne, format_bs_iso
+from core.date_context import build_date_block
 from core.bot_helpers import (
     DISCORD_EMBED_FOOTER_LIMIT,
     DISCORD_MSG_LIMIT,
@@ -349,20 +350,8 @@ async def on_message(message):
             )
 
             today = datetime.date.today()
-            today_str = today.strftime("%Y-%m-%d")
-            # Inject a concrete BS date so Sarvam doesn't hallucinate the
-            # Nepali calendar when asked "आज भन्नाले कहिले हो?". Falls
-            # back to AD-only if nepali-datetime isn't installed.
-            bs_ne = format_bs_ne(today)
-            bs_iso = format_bs_iso(today)
-            bs_line = ""
-            if bs_ne and bs_iso:
-                bs_line = f"\nBikram Sambat: {bs_iso} ({bs_ne})"
-            dynamic_system_prompt = (
-                f"{SYSTEM_PROMPT}\n\n# CURRENT DATE:\n"
-                f"Today's Date (AD): {today_str}{bs_line}\n"
-                f"Use these dates as ground truth — do not hallucinate the BS date."
-            )
+            date_block = build_date_block(today)
+            dynamic_system_prompt = f"{SYSTEM_PROMPT}\n\n{date_block}"
             messages = [{"role": "system", "content": dynamic_system_prompt}]
 
             # Per-message try/except: one weird Discord message (None
