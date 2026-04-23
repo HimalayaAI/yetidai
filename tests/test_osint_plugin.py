@@ -23,8 +23,13 @@ class OsintPluginSpecTests(unittest.TestCase):
         self.assertEqual(tool["type"], "function")
         func = tool["function"]
         self.assertEqual(func["name"], "get_nepal_live_context")
-        self.assertIn("focus", func["parameters"]["properties"])
-        self.assertEqual(func["parameters"]["required"], ["focus"])
+        props = func["parameters"]["properties"]
+        # Both `intent` and `focus` are now exposed, both optional —
+        # explicit intent short-circuits the internal router.
+        self.assertIn("intent", props)
+        self.assertIn("focus", props)
+        self.assertIn("enum", props["intent"])
+        self.assertEqual(func["parameters"]["required"], [])
         self.assertFalse(func["parameters"]["additionalProperties"])
 
     def test_spec_is_enabled(self) -> None:
