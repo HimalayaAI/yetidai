@@ -321,23 +321,13 @@ def is_real_tool_content(result: Any) -> bool:
 _CORRECTION_MARKERS: tuple[str, ...] = (
     # Devanagari
     "होइन", "गलत", "त्यो होइन", "फरक", "फेरि पढ",
-    "झुटो", "बकवास", "गफ हान", "गफ चोडि",
     # Romanised Nepali
     "haina", "hoina", "bahenyko haina", "bhaneko haina",
     "purano", "maile bhaneko", "galat", "milaunu",
-    # "guff hannu / guff chodnu / bakwas / jhuto" = accusing the bot of
-    # bullshitting. Observed failure: Yeti parsed "feri guff hannu huncha"
-    # as a person's name ("Guff Hannu") instead of a correction signal.
-    "guff hann", "guff chod", "gap hann", "bakwas", "jhuto", "jhut bol",
-    # Factual-correction hooks — user states a fact that contradicts
-    # the previous answer ("X resign gareko", "X nai haina").
-    "resign gar", "resign bha", "resign gareko",
     # English
     "not that", "wrong answer", "that's wrong", "that is not",
     "you misunderstood", "re-read", "i asked", "i said",
     "different from", "you didn't understand",
-    "are you sure", "you're making", "you are making", "making it up",
-    "hallucinat", "bullshit",
 )
 
 # Rough "N items requested" detector. Handles Devanagari + ASCII digits
@@ -401,15 +391,7 @@ def build_correction_nudge(
         "प्रयोगकर्ताको वास्तविक प्रश्न के हो ध्यान दिएर पुनः लेख्नुहोस्। "
         "अघिल्लो जवाफ दोहोऱ्याउनुहुन्न। कुनै पनि entry दुई पटक नलेख्नुहोस् — "
         "tool output मा जति unique items छन् त्यति नै देखाउनुहोस्। "
-        "यदि tool ले पर्याप्त डेटा दिएन भने, माफी मागेर खुलस्त भन्नुहोस्।\n"
-        "**महत्वपूर्ण:** यदि user ले factual correction दिनुभयो "
-        "('X resign गरेको', 'X होइन', 'पुरानो data') वा तपाईंलाई झुट/गफ "
-        "हानेको आरोप लगाउनुभयो ('guff hann', 'जुठो', 'bakwas', 'making "
-        "things up'), तपाईंले **अवश्य** नयाँ tool call गर्नुपर्छ — "
-        "memory बाट नयाँ उत्तर कहिल्यै नलेख्नुहोस्। Nepal facts: "
-        "`get_nepal_live_context`; world facts: `internet_search`। "
-        "'guff hannu', 'बकवास', 'झुटो' आदि व्यक्तिको नाम होइनन् — यी "
-        "accusation हुन्, entity मानेर खोज्नुहुन्न।"
+        "यदि tool ले पर्याप्त डेटा दिएन भने, माफी मागेर खुलस्त भन्नुहोस्।"
         f"{extra}"
     )
 
@@ -438,34 +420,14 @@ _EMPTY_PROMISE_PATTERNS: tuple["re.Pattern[str]", ...] = (
     # Future-tense "will do / will help / will look" — the GitHub-commit
     # trace landed on "help गर्नेछु" which the earlier pattern set missed.
     re.compile(r"म .{0,60}(?:गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|खोज्नेछु|खोज्छु)"),
-    # Present-continuous "am ...ing" forms. Observed: "म नेपालको
-    # वर्तमान प्रधानमन्त्री खोज्दैछु।" — same empty-promise shape as
-    # "खोज्छु" (future) but in present-continuous (-दैछु ending).
-    # Without these the safety net misses a whole class of placeholder
-    # replies and ships them to Discord raw.
-    re.compile(r"म .{0,60}(?:गर्दैछु|हेर्दैछु|खोज्दैछु|ल्याउँदैछु|"
-               r"पठाउँदैछु|बताउँदैछु|सुनाउँदैछु|दिँदैछु)"),
     re.compile(r"तपाईं(?:ँ|ले|लाई).{0,60}(?:बताउँछु|सुनाउँछु|दिन्छु|पठाउँछु|"
-               r"गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|ल्याउँछु|ल्याउनेछु|"
-               r"गर्दैछु|हेर्दैछु|खोज्दैछु)"),
+               r"गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|ल्याउँछु|ल्याउनेछु)"),
     re.compile(r"help गर्(?:छु|नेछु)", re.IGNORECASE),
     re.compile(r"let me (fetch|search|check|look|see|analyze|bring|find)", re.IGNORECASE),
     re.compile(
         r"i ?(will|'ll|'d) (fetch|search|check|look|provide|get|tell|help|analyze|see|bring|find)",
         re.IGNORECASE,
     ),
-    # "Pre-refusal" — bot claims it can't answer without ever calling a
-    # tool. Observed: "मेरो डेटामा छैन / जानकारी छैन / data मा छैन" on
-    # a Nepal PM query that should have gone to get_nepal_live_context.
-    # These patterns fire is_empty_promise → the force-tool retry path.
-    re.compile(r"(?:मेरो|mero)\s*(?:data|डाटा|डेटा)\s*मा?\s*छैन", re.IGNORECASE),
-    re.compile(r"(?:डेटा|डाटा|data)\s*मा\s*छैन", re.IGNORECASE),
-    re.compile(r"(?:जानकारी|information)\s*(?:मेरो|mero)?\s*(?:मा|मसँग)?\s*छैन",
-               re.IGNORECASE),
-    re.compile(r"मलाई\s+(?:थाहा|पत्ता)\s+छैन"),
-    re.compile(r"मसँग.{0,30}(?:डेटा|जानकारी|data).{0,10}छैन"),
-    re.compile(r"(?:i\s+)?don.?t\s+(?:know|have\s+(?:the|that)\s+(?:data|info))",
-               re.IGNORECASE),
 )
 
 # Short reply + any promise pattern is the smoking-gun shape. Long
@@ -591,201 +553,19 @@ def news_answer_off_topic(
     return not looks_like_news_answer(answer)
 
 
-def _suggest_tool_for(user_text: str) -> str:
-    """Return a concrete tool+args hint based on lightweight routing of the
-    user's message. Used inside build_force_tool_nudge to make the retry's
-    nudge directive rather than generic — Sarvam ignores generic "call any
-    tool" hints more often than it ignores "call X with these args".
-    """
-    if not user_text:
-        return ""
-    t = user_text.lower()
-    # Nepal PM identity
-    if re.search(r"\b(pradhan\s?mantri|pradanmantri|प्रधानमन्त्री|\bpm\b)\b.*(ko ho|को हो|को हुन)",
-                 t):
-        return ('get_nepal_live_context(intent="who_is", focus="prime_minister")')
-    if re.search(r"\b(home\s?minister|ग्रहमन्त्री|गृहमन्त्री|\bhm\b)\b", t):
-        return ('get_nepal_live_context(intent="who_is", focus="home_minister")')
-    if re.search(r"\b(finance\s?minister|अर्थमन्त्री|\bfm\b)\b", t):
-        return ('get_nepal_live_context(intent="who_is", focus="finance_minister")')
-    # News
-    if re.search(r"\b(samachar|khabar|news|समाचार|खबर)\b", t):
-        return ('get_nepal_live_context(intent="general_news")')
-    # Inflation / macro
-    if re.search(r"(inflation|मुद्रास्फीति|remittance|रेमिट्यान्स|reserves|रिजर्भ)",
-                 t):
-        return ('get_nepal_live_context(intent="macro")')
-    # NEPSE / trading
-    if re.search(r"(nepse|ipo|dividend|share\s?price)", t):
-        return ('get_nepal_live_context(intent="trading")')
-    # Parliament
-    if re.search(r"(parliament|संसद|विधेयक|बिल)", t):
-        return ('get_nepal_live_context(intent="parliament")')
-    # Resign / cabinet shake-ups → news lookup. Observed:
-    # "SUDAN GURUNG le kina resign gareyko" had no specific intent
-    # match and got no hint, leading to another empty promise.
-    if re.search(r"(resign|कार्यभार छोड|राजीनामा|बर्खास्त|nikalek|nikalyaeko)", t):
-        return ('get_nepal_live_context(intent="general_news")')
-    # GitHub
-    if re.search(r"github\.com|\brepo\b|\brepos\b", t):
-        return ("analyze_github_repo वा list_github_repos")
-    # URL
-    if re.search(r"https?://", t):
-        return ("fetch_url(url=<पेस्ट गरिएको URL>)")
-    return ""
-
-
 def build_force_tool_nudge(user_text: str) -> str:
     """System message used to retry after an empty-promise answer.
 
     Kept short so it doesn't push the already-long system prompt off the
     attention window. The model sees this AFTER its promise text, so it
     effectively reads: "I said I'd fetch. System reminder: actually fetch."
-    A concrete tool-and-args hint is appended when we can route the
-    message ourselves — generic "call any tool" nudges get ignored more
-    often than directive "call X(args=...)" ones.
-    """
-    hint = _suggest_tool_for(user_text)
-    hint_line = (
-        f" यो प्रश्नको लागि सही tool: **{hint}**। यही call emit गर्नुहोस्।"
-        if hint else ""
-    )
-    return (
-        "तपाईंले अघिल्लो turn मा कुनै tool call emit नगरी 'म बताउँछु' "
-        "/ 'म खोज्छु' जस्तो वाचा मात्र लेख्नुभयो। यो bug हो — प्रयोगकर्ताले "
-        "actual data माग्दै हुनुहुन्छ। अहिले नै उपयुक्त tool call emit "
-        "गर्नुहोस् (get_nepal_live_context / internet_search / fetch_url / "
-        "analyze_github_repo मध्ये एक)।"
-        f"{hint_line}"
-        " वाचा नगरी सिधै tool call दिनुहोस्।"
-    )
-
-
-# ── Tool-narration detector ───────────────────────────────────────
-#
-# Production failure (observed 2026-04-23): user asks "Nepal ko ahile ko
-# home minister ko ho". Tool runs and returns real data. But Yeti's final
-# reply is "get_nepal_live_context tool use गरेर query process गरिँदैछ।
-# Tool call सफल भयो।" — it narrates the MECHANICS instead of USING the
-# data to answer. `is_empty_promise` doesn't catch this (tool WAS used,
-# past-tense narration not future-tense promise). This is the guard.
-
-_TOOL_NARRATION_PATTERNS: tuple["re.Pattern[str]", ...] = (
-    # "tool call / tool use / tool invoke" as a noun phrase in the answer
-    re.compile(r"\btool[_\s]?call[s]?\b", re.IGNORECASE),
-    re.compile(r"\btool\s+(?:use|invoke|invocation|run)\b", re.IGNORECASE),
-    # "X tool use गरेर" — Devanagari wrapper around English "tool use"
-    re.compile(r"tool\s+(?:use|call)\s+गर", re.IGNORECASE),
-    # "query process गरिँदैछ / गरियो / गर्दैछु"
-    re.compile(r"\b(?:query|data|request|response)\s+(?:process|retrieve|fetch)",
-               re.IGNORECASE),
-    re.compile(r"process\s+गरि(?:न्छ|ँदैछ|एको|यो|ँदै)"),
-    re.compile(r"retrieve\s+गरि(?:न्छ|ँदैछ|एको|यो|ँदै)", re.IGNORECASE),
-    # "Tool call सफल भयो / असफल भयो"
-    re.compile(r"tool[_\s]?call[s]?\s+(?:सफल|असफल|भयो|गरियो)", re.IGNORECASE),
-)
-
-# Narration is always short. Long answers that happen to mention "tool"
-# as a legit English word are not narration.
-_TOOL_NARRATION_MAX_CHARS = 320
-
-
-def is_tool_narration(text: str | None) -> bool:
-    """Heuristic: is the reply a meta-narration of the tool mechanics?
-
-    Signals:
-      1. Reply is short (narrations are always one- or two-liner status lines).
-      2. Matches one of the tool-mechanics phrase patterns above.
-
-    NOT gated on `tool_was_used` — narrating a tool call is a bug whether
-    the tool actually ran or not. Paired with a rewrite retry in bot.py.
-    """
-    if not text:
-        return False
-    stripped = text.strip()
-    if not stripped or len(stripped) > _TOOL_NARRATION_MAX_CHARS:
-        return False
-    return any(pat.search(stripped) for pat in _TOOL_NARRATION_PATTERNS)
-
-
-# ── Tool-output-ignored detector ──────────────────────────────────
-#
-# Production failure (observed 2026-04-23): user asks "balendra shah search
-# garnus" → tool runs → returns 5 relevant Balendra Shah URLs (bot even
-# ships them in the Sources embed) → but Yeti's text body says
-# "मलाई खोज्दा भेटिएन। मेरो डेटामा छैन।" — denying the very data the
-# tool just returned. `is_empty_promise` and `is_tool_narration` both
-# miss this: the answer is long-ish, past-tense, tool_was_used=True.
-# This is the guard.
-
-_TOOL_DENIAL_PATTERNS: tuple["re.Pattern[str]", ...] = (
-    re.compile(r"\bभेटिएन\b"),
-    re.compile(r"(?:डेटा|डाटा|data)\s*मा?\s*छैन", re.IGNORECASE),
-    re.compile(r"जानकारी\s*(?:मेरो|मसँग)?\s*(?:मा|मसँग)?\s*छैन"),
-    re.compile(r"उपलब्ध\s*छैन"),
-    re.compile(r"(?:i\s+)?(?:don.?t|do\s+not)\s+(?:have|know)", re.IGNORECASE),
-    re.compile(r"no\s+(?:data|info|information|results)\s+(?:found|available)",
-               re.IGNORECASE),
-)
-
-
-def is_tool_output_ignored(
-    text: str | None,
-    *,
-    tool_was_used: bool,
-    citation_urls: Iterable[str] | None = None,
-) -> bool:
-    """Heuristic: did the model deny having data that the tool just returned?
-
-    Signals (ALL must hold):
-      1. A tool actually ran successfully this turn (tool_was_used=True).
-      2. The tool produced at least one citable URL (something real came back).
-      3. The answer body contains a denial phrase ("भेटिएन / डेटामा छैन /
-         don't have / no info").
-    """
-    if not tool_was_used or not text:
-        return False
-    urls = list(citation_urls or [])
-    if not urls:
-        return False
-    stripped = text.strip()
-    if not stripped:
-        return False
-    return any(pat.search(stripped) for pat in _TOOL_DENIAL_PATTERNS)
-
-
-def build_tool_output_ignored_nudge() -> str:
-    """System message asking the model to actually use the tool output.
-
-    Pairs with is_tool_output_ignored. No new tool call — the data is
-    already in the message history; we just need the model to read it.
     """
     return (
-        "तपाईंको अघिल्लो जवाफले 'भेटिएन / डेटामा छैन / जानकारी छैन' भन्यो, "
-        "तर वास्तवमा tool ले data फर्काएको छ (माथिको tool message मा URL "
-        "हरू सहित बसेको छ)। यो गम्भीर bug हो — user को विश्वास जान्छ। "
-        "अहिले नै tool output पढ्नुहोस्, त्यसमा भएको जानकारी प्रयोग गरेर "
-        "user को प्रश्नको सिधा नेपाली उत्तर लेख्नुहोस् + स्रोत: रेखा। "
-        "'भेटिएन' भन्न बन्द गर्नुहोस् — data त्यहीं छ। कुनै नयाँ tool "
-        "call नगर्नुहोस्।"
-    )
-
-
-def build_tool_narration_nudge() -> str:
-    """System message used to force a rewrite after a tool-narration reply.
-
-    Unlike `build_force_tool_nudge`, this does NOT ask for a new tool call —
-    the tool already ran and its output is in the message history. We just
-    need the model to USE that data and write the actual Nepali answer.
-    """
-    return (
-        "तपाईंको अघिल्लो जवाफले tool call को मेकानिकी मात्र वर्णन गर्‍यो "
-        "('tool call सफल भयो', 'query process गरिँदैछ' जस्ता वाक्य)। यो "
-        "bug हो — user लाई tool को status चाहिँदैन, प्रश्नको उत्तर चाहिन्छ। "
-        "Tool ले फर्काएको data (माथिको tool message मा छ) प्रयोग गरेर "
-        "प्रश्नको सिधा नेपाली उत्तर लेख्नुहोस् + स्रोत: रेखा। अन्तिम जवाफमा "
-        "'tool', 'tool call', 'query process', 'सफल भयो' जस्ता शब्द "
-        "नआओस्। कुनै नयाँ tool call नगर्नुहोस् — केवल जवाफ लेख्नुहोस्।"
+        "तपाईंले अघिल्लो turn मा कुनै tool call emit नगरी 'म बताउँछु' जस्तो "
+        "वाचा मात्र लेख्नुभयो। यो bug हो — प्रयोगकर्ताले actual data माग्दै "
+        "हुनुहुन्छ। अहिले नै उपयुक्त tool call emit गर्नुहोस् "
+        "(get_nepal_live_context / internet_search / fetch_url / "
+        "analyze_github_repo मध्ये एक)। वाचा नगरी सिधै tool call दिनुहोस्।"
     )
 
 

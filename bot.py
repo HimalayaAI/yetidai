@@ -71,8 +71,6 @@ from core.bot_helpers import (
     TOOL_TIMEOUT_MARKER,
     build_correction_nudge,
     build_force_tool_nudge,
-    build_tool_narration_nudge,
-    build_tool_output_ignored_nudge,
     chunk_for_discord,
     classify_llm_error,
     detect_fabricated_filenames,
@@ -85,8 +83,6 @@ from core.bot_helpers import (
     is_bot_apology,
     is_empty_promise,
     is_real_tool_content,
-    is_tool_narration,
-    is_tool_output_ignored,
     is_transient_llm_error,
     looks_like_correction,
     needs_tool_use,
@@ -771,70 +767,6 @@ async def on_message(message):
             if response and getattr(response, "choices", None):
                 ai_response = response.choices[0].message.content or ""
 
-            # Tool-narration rescue (same-turn):
-            # Model used the tool but its final reply narrates the mechanics
-            # ("tool call सफल भयो / query process गरिँदैछ") instead of using
-            # the returned data. The tool output is already in `messages` —
-            # just ask the model to rewrite WITHOUT another tool call.
-            if tool_was_used and is_tool_narration(ai_response):
-                logger.info(
-                    "Tool-narration detected (turn=%s): %r — forcing rewrite.",
-                    turn_id, ai_response[:120],
-                )
-                messages.append({"role": "assistant", "content": ai_response})
-                messages.append({
-                    "role": "system",
-                    "content": build_tool_narration_nudge(),
-                })
-                try:
-                    rewrite_resp = await _run_llm_turn(
-                        messages, tools_array=None, tool_choice=None,
-                    )
-                except Exception:
-                    rewrite_resp = None
-                if rewrite_resp and getattr(rewrite_resp, "choices", None):
-                    rewrite_text = (
-                        rewrite_resp.choices[0].message.content or ""
-                    ).strip()
-                    if rewrite_text and not is_tool_narration(rewrite_text):
-                        ai_response = rewrite_text
-
-            # Tool-output-ignored rescue (same-turn):
-            # Tool returned real content + citation URLs, but the model's
-            # answer denies having any data ("भेटिएन / डेटामा छैन"). Same
-            # mechanism — inject a corrective system msg + rewrite without
-            # another tool call, since the data is already in the history.
-            if is_tool_output_ignored(
-                ai_response,
-                tool_was_used=tool_was_used,
-                citation_urls=citation_urls,
-            ):
-                logger.info(
-                    "Tool-output-ignored detected (turn=%s): %r — forcing rewrite.",
-                    turn_id, ai_response[:120],
-                )
-                messages.append({"role": "assistant", "content": ai_response})
-                messages.append({
-                    "role": "system",
-                    "content": build_tool_output_ignored_nudge(),
-                })
-                try:
-                    rewrite_resp = await _run_llm_turn(
-                        messages, tools_array=None, tool_choice=None,
-                    )
-                except Exception:
-                    rewrite_resp = None
-                if rewrite_resp and getattr(rewrite_resp, "choices", None):
-                    rewrite_text = (
-                        rewrite_resp.choices[0].message.content or ""
-                    ).strip()
-                    if rewrite_text and not is_tool_output_ignored(
-                        rewrite_text,
-                        tool_was_used=tool_was_used,
-                        citation_urls=citation_urls,
-                    ):
-                        ai_response = rewrite_text
-
             # Empty-promise rescue (same-turn):
             # 1. Pure empty promise ("म बताउँछु / I'll fetch") with no tool used
             #    and the query clearly needed a tool.
@@ -963,32 +895,6 @@ async def on_message(message):
         except Exception as exc:
             logger.exception("Sarvam call / tool loop failed")
             llm_exc = exc
-
-        # ── Unconditional empty-promise safety net ───────────────
-        # The in-loop safety net above only fires inside `if needs_retry`.
-        # If the retry path is short-circuited for any reason (Sarvam
-        # rejecting tool_choice="required" on both passes, an exception
-        # bubbling through both LLM calls, tools_array being empty on a
-        # weird turn, etc.), an empty promise like "म यसलाई खोज्छु।"
-        # would ship straight to Discord. This unconditional pass
-        # catches that final case — if the answer is still just a
-        # promise and the user clearly asked for data, replace it with
-        # an honest apology rather than the bare promise.
-        if (
-            ai_response
-            and is_empty_promise(ai_response, tool_was_used=tool_was_used)
-            and needs_tool_use(chad.user_input)
-        ):
-            logger.warning(
-                "Empty promise reached post-loop unconditionally (turn=%s): %r — "
-                "replacing with apology.",
-                turn_id, ai_response[:120],
-            )
-            ai_response = (
-                "माफ गर्नुहोस् हजुर — अहिले यो प्रश्नको लागि live data "
-                "ल्याउन सकिएन। केही सेकेन्डपछि पुनः सोध्नुहोस्, वा अलि "
-                "विस्तृत प्रश्न दिनुहोस्।"
-            )
 
         # ── Anti-hallucination: fabricated filenames ─────────────
         #
