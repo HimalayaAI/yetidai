@@ -137,7 +137,9 @@ def classify_llm_error(exc: BaseException | None) -> str:
     these out of replayed context.
     """
     if exc is None:
-        return GENERIC_TECH_ERROR
+        # DEBUG: caller reached the error branch without an exception —
+        # usually means ai_response was empty / all retries produced nothing.
+        return f"{GENERIC_TECH_ERROR}\n[debug] no-exception; empty answer"
     if isinstance(exc, asyncio.TimeoutError):
         return (
             "माफ गर्नुहोस्, Sarvam जवाफ दिन ढिला भयो। एकछिन पछि पुनः प्रयास गर्नुहोस्।"
@@ -154,7 +156,11 @@ def classify_llm_error(exc: BaseException | None) -> str:
         )
     if "connect" in name or "network" in name:
         return "माफ गर्नुहोस्, नेटवर्क समस्या देखियो। पुनः प्रयास गर्नुहोस्।"
-    return GENERIC_TECH_ERROR
+    # DEBUG: surface exception class + short message so the unknown-error
+    # failure mode can be diagnosed without server log access. Revert this
+    # once the root cause is identified.
+    detail = f"{type(exc).__name__}: {str(exc)[:160]}"
+    return f"{GENERIC_TECH_ERROR}\n[debug] {detail}"
 
 
 def with_turn_id(message: str, turn_id: str | None) -> str:
