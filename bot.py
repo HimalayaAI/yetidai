@@ -60,6 +60,7 @@ from core.output_validator import validate_answer, build_fix_message
 from core.request_log import log_turn
 from core.nepali_date import format_bs_ne, format_bs_iso
 from core.date_context import build_date_block
+from core.preflight import plan_preflight
 from core.bot_helpers import (
     DISCORD_EMBED_FOOTER_LIMIT,
     DISCORD_MSG_LIMIT,
@@ -344,6 +345,10 @@ async def on_message(message):
         ai_response = ""
         citation_urls: list[str] = []
         llm_exc: BaseException | None = None
+        # Accumulated tool content for the turn — used by the hallucination
+        # check AND populated by the preflight step below. Must be defined
+        # before the try-block so preflight and in-loop paths share it.
+        tool_output_accum: list[str] = []
 
         # ── Build message list ────────────────────────────────────
         try:
@@ -409,6 +414,118 @@ async def on_message(message):
 
             messages.append({"role": "user", "content": chad.user_input})
             tools_array = registry.openai_tools()
+
+            # ── Pre-flight tool execution ─────────────────────────
+            # Deterministic rule-based classifier decides if the query
+            # needs a specific tool. If yes, we execute it NOW and feed
+            # the result into messages as a synthetic prior tool call.
+            # Sarvam's first turn then has the data in context and only
+            # needs to write the Nepali summary — it literally cannot
+            # emit "म खोज्छु" any more, because the work is done.
+            preflight = plan_preflight(chad.user_input)
+            if preflight is not None:
+                pf_name, pf_args = preflight
+                pf_tc_id = f"preflight_{uuid.uuid4().hex[:8]}"
+                pf_ctx = ToolContext(
+                    query=chad.user_input,
+                    history=previous_messages,
+                    llm_client=llm_client,
+                    channel_id=message.channel.id,
+                    user_id=message.author.id,
+                )
+                logger.info(
+                    "Preflight (turn=%s): %s(%s)", turn_id, pf_name, pf_args,
+                )
+                try:
+                    pf_result = await asyncio.wait_for(
+                        registry.execute(pf_name, pf_ctx, pf_args),
+                        timeout=YETI_TOOL_TIMEOUT,
+                    )
+                except Exception as exc:
+                    logger.exception("Preflight failed: %s", exc)
+                    pf_result = None
+
+                if pf_result is not None:
+                    # Append the synthetic tool_call + tool result as if
+                    # Sarvam had already chosen this tool. Sarvam's next
+                    # turn sees a completed interaction and continues.
+                    messages.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": pf_tc_id,
+                            "type": "function",
+                            "function": {
+                                "name": pf_name,
+                                "arguments": json.dumps(
+                                    pf_args, ensure_ascii=False,
+                                ),
+                            },
+                        }],
+                    })
+                    messages.append(pf_result.to_tool_message(pf_tc_id))
+                    tool_calls_log.append({
+                        "name": pf_name,
+                        "args": pf_args,
+                        "success": pf_result.success,
+                        "preflight": True,
+                    })
+                    if is_real_tool_content(pf_result):
+                        tool_was_used = True
+                        if pf_result.content:
+                            tool_output_accum.append(pf_result.content)
+                    citation_urls.extend(extract_urls(pf_result.content))
+                    if pf_result.meta:
+                        osint_endpoints_ok = pf_result.meta.get(
+                            "endpoints_ok", osint_endpoints_ok,
+                        )
+                        osint_endpoints_failed = pf_result.meta.get(
+                            "endpoints_failed", osint_endpoints_failed,
+                        )
+
+                    # If the preflight triggered a fallback (e.g. OSINT
+                    # returned empty → internet_search), execute the
+                    # fallback too so Sarvam has that data as well.
+                    if pf_result.trigger_fallback and pf_result.fallback_tool:
+                        fb_tc_id = f"preflight_fb_{uuid.uuid4().hex[:8]}"
+                        fb_args = pf_result.fallback_args or {}
+                        try:
+                            fb_result = await asyncio.wait_for(
+                                registry.execute(
+                                    pf_result.fallback_tool, pf_ctx, fb_args,
+                                ),
+                                timeout=YETI_TOOL_TIMEOUT,
+                            )
+                        except Exception:
+                            fb_result = None
+                        if fb_result is not None:
+                            messages.append({
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": fb_tc_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": pf_result.fallback_tool,
+                                        "arguments": json.dumps(
+                                            fb_args, ensure_ascii=False,
+                                        ),
+                                    },
+                                }],
+                            })
+                            messages.append(fb_result.to_tool_message(fb_tc_id))
+                            tool_calls_log.append({
+                                "name": pf_result.fallback_tool,
+                                "args": fb_args,
+                                "success": fb_result.success,
+                                "preflight_fallback": True,
+                            })
+                            if is_real_tool_content(fb_result):
+                                tool_was_used = True
+                                if fb_result.content:
+                                    tool_output_accum.append(fb_result.content)
+                            citation_urls.extend(extract_urls(fb_result.content))
+                            fallback_used = True
         except Exception:
             logger.exception("Failed building request context")
             await message.channel.send(with_turn_id(GENERIC_TECH_ERROR, turn_id))
@@ -439,10 +556,6 @@ async def on_message(message):
         dedup_cache: dict[str, ToolResult] = {}
         last_round_signature: tuple | None = None
         final_nudge_injected = False
-        # Accumulated tool content for the turn — used by the post-answer
-        # hallucination check (e.g. analyze_github_repo returned tree doesn't
-        # list `NepaliNewsAggregator.py`, but the model cited it anyway).
-        tool_output_accum: list[str] = []
         try:
             for _round in range(MAX_TOOL_ROUNDS):
                 is_last_round = (_round == MAX_TOOL_ROUNDS - 1)
