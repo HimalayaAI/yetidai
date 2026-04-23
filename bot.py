@@ -72,6 +72,7 @@ from core.bot_helpers import (
     build_correction_nudge,
     build_force_tool_nudge,
     build_tool_narration_nudge,
+    build_tool_output_ignored_nudge,
     chunk_for_discord,
     classify_llm_error,
     detect_fabricated_filenames,
@@ -85,6 +86,7 @@ from core.bot_helpers import (
     is_empty_promise,
     is_real_tool_content,
     is_tool_narration,
+    is_tool_output_ignored,
     is_transient_llm_error,
     looks_like_correction,
     needs_tool_use,
@@ -795,6 +797,42 @@ async def on_message(message):
                         rewrite_resp.choices[0].message.content or ""
                     ).strip()
                     if rewrite_text and not is_tool_narration(rewrite_text):
+                        ai_response = rewrite_text
+
+            # Tool-output-ignored rescue (same-turn):
+            # Tool returned real content + citation URLs, but the model's
+            # answer denies having any data ("भेटिएन / डेटामा छैन"). Same
+            # mechanism — inject a corrective system msg + rewrite without
+            # another tool call, since the data is already in the history.
+            if is_tool_output_ignored(
+                ai_response,
+                tool_was_used=tool_was_used,
+                citation_urls=citation_urls,
+            ):
+                logger.info(
+                    "Tool-output-ignored detected (turn=%s): %r — forcing rewrite.",
+                    turn_id, ai_response[:120],
+                )
+                messages.append({"role": "assistant", "content": ai_response})
+                messages.append({
+                    "role": "system",
+                    "content": build_tool_output_ignored_nudge(),
+                })
+                try:
+                    rewrite_resp = await _run_llm_turn(
+                        messages, tools_array=None, tool_choice=None,
+                    )
+                except Exception:
+                    rewrite_resp = None
+                if rewrite_resp and getattr(rewrite_resp, "choices", None):
+                    rewrite_text = (
+                        rewrite_resp.choices[0].message.content or ""
+                    ).strip()
+                    if rewrite_text and not is_tool_output_ignored(
+                        rewrite_text,
+                        tool_was_used=tool_was_used,
+                        citation_urls=citation_urls,
+                    ):
                         ai_response = rewrite_text
 
             # Empty-promise rescue (same-turn):

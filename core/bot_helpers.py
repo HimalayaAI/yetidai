@@ -321,13 +321,23 @@ def is_real_tool_content(result: Any) -> bool:
 _CORRECTION_MARKERS: tuple[str, ...] = (
     # Devanagari
     "होइन", "गलत", "त्यो होइन", "फरक", "फेरि पढ",
+    "झुटो", "बकवास", "गफ हान", "गफ चोडि",
     # Romanised Nepali
     "haina", "hoina", "bahenyko haina", "bhaneko haina",
     "purano", "maile bhaneko", "galat", "milaunu",
+    # "guff hannu / guff chodnu / bakwas / jhuto" = accusing the bot of
+    # bullshitting. Observed failure: Yeti parsed "feri guff hannu huncha"
+    # as a person's name ("Guff Hannu") instead of a correction signal.
+    "guff hann", "guff chod", "gap hann", "bakwas", "jhuto", "jhut bol",
+    # Factual-correction hooks — user states a fact that contradicts
+    # the previous answer ("X resign gareko", "X nai haina").
+    "resign gar", "resign bha", "resign gareko",
     # English
     "not that", "wrong answer", "that's wrong", "that is not",
     "you misunderstood", "re-read", "i asked", "i said",
     "different from", "you didn't understand",
+    "are you sure", "you're making", "you are making", "making it up",
+    "hallucinat", "bullshit",
 )
 
 # Rough "N items requested" detector. Handles Devanagari + ASCII digits
@@ -391,7 +401,15 @@ def build_correction_nudge(
         "प्रयोगकर्ताको वास्तविक प्रश्न के हो ध्यान दिएर पुनः लेख्नुहोस्। "
         "अघिल्लो जवाफ दोहोऱ्याउनुहुन्न। कुनै पनि entry दुई पटक नलेख्नुहोस् — "
         "tool output मा जति unique items छन् त्यति नै देखाउनुहोस्। "
-        "यदि tool ले पर्याप्त डेटा दिएन भने, माफी मागेर खुलस्त भन्नुहोस्।"
+        "यदि tool ले पर्याप्त डेटा दिएन भने, माफी मागेर खुलस्त भन्नुहोस्।\n"
+        "**महत्वपूर्ण:** यदि user ले factual correction दिनुभयो "
+        "('X resign गरेको', 'X होइन', 'पुरानो data') वा तपाईंलाई झुट/गफ "
+        "हानेको आरोप लगाउनुभयो ('guff hann', 'जुठो', 'bakwas', 'making "
+        "things up'), तपाईंले **अवश्य** नयाँ tool call गर्नुपर्छ — "
+        "memory बाट नयाँ उत्तर कहिल्यै नलेख्नुहोस्। Nepal facts: "
+        "`get_nepal_live_context`; world facts: `internet_search`। "
+        "'guff hannu', 'बकवास', 'झुटो' आदि व्यक्तिको नाम होइनन् — यी "
+        "accusation हुन्, entity मानेर खोज्नुहुन्न।"
         f"{extra}"
     )
 
@@ -428,6 +446,18 @@ _EMPTY_PROMISE_PATTERNS: tuple["re.Pattern[str]", ...] = (
         r"i ?(will|'ll|'d) (fetch|search|check|look|provide|get|tell|help|analyze|see|bring|find)",
         re.IGNORECASE,
     ),
+    # "Pre-refusal" — bot claims it can't answer without ever calling a
+    # tool. Observed: "मेरो डेटामा छैन / जानकारी छैन / data मा छैन" on
+    # a Nepal PM query that should have gone to get_nepal_live_context.
+    # These patterns fire is_empty_promise → the force-tool retry path.
+    re.compile(r"(?:मेरो|mero)\s*(?:data|डाटा|डेटा)\s*मा?\s*छैन", re.IGNORECASE),
+    re.compile(r"(?:डेटा|डाटा|data)\s*मा\s*छैन", re.IGNORECASE),
+    re.compile(r"(?:जानकारी|information)\s*(?:मेरो|mero)?\s*(?:मा|मसँग)?\s*छैन",
+               re.IGNORECASE),
+    re.compile(r"मलाई\s+(?:थाहा|पत्ता)\s+छैन"),
+    re.compile(r"मसँग.{0,30}(?:डेटा|जानकारी|data).{0,10}छैन"),
+    re.compile(r"(?:i\s+)?don.?t\s+(?:know|have\s+(?:the|that)\s+(?:data|info))",
+               re.IGNORECASE),
 )
 
 # Short reply + any promise pattern is the smoking-gun shape. Long
@@ -614,6 +644,69 @@ def is_tool_narration(text: str | None) -> bool:
     if not stripped or len(stripped) > _TOOL_NARRATION_MAX_CHARS:
         return False
     return any(pat.search(stripped) for pat in _TOOL_NARRATION_PATTERNS)
+
+
+# ── Tool-output-ignored detector ──────────────────────────────────
+#
+# Production failure (observed 2026-04-23): user asks "balendra shah search
+# garnus" → tool runs → returns 5 relevant Balendra Shah URLs (bot even
+# ships them in the Sources embed) → but Yeti's text body says
+# "मलाई खोज्दा भेटिएन। मेरो डेटामा छैन।" — denying the very data the
+# tool just returned. `is_empty_promise` and `is_tool_narration` both
+# miss this: the answer is long-ish, past-tense, tool_was_used=True.
+# This is the guard.
+
+_TOOL_DENIAL_PATTERNS: tuple["re.Pattern[str]", ...] = (
+    re.compile(r"\bभेटिएन\b"),
+    re.compile(r"(?:डेटा|डाटा|data)\s*मा?\s*छैन", re.IGNORECASE),
+    re.compile(r"जानकारी\s*(?:मेरो|मसँग)?\s*(?:मा|मसँग)?\s*छैन"),
+    re.compile(r"उपलब्ध\s*छैन"),
+    re.compile(r"(?:i\s+)?(?:don.?t|do\s+not)\s+(?:have|know)", re.IGNORECASE),
+    re.compile(r"no\s+(?:data|info|information|results)\s+(?:found|available)",
+               re.IGNORECASE),
+)
+
+
+def is_tool_output_ignored(
+    text: str | None,
+    *,
+    tool_was_used: bool,
+    citation_urls: Iterable[str] | None = None,
+) -> bool:
+    """Heuristic: did the model deny having data that the tool just returned?
+
+    Signals (ALL must hold):
+      1. A tool actually ran successfully this turn (tool_was_used=True).
+      2. The tool produced at least one citable URL (something real came back).
+      3. The answer body contains a denial phrase ("भेटिएन / डेटामा छैन /
+         don't have / no info").
+    """
+    if not tool_was_used or not text:
+        return False
+    urls = list(citation_urls or [])
+    if not urls:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return any(pat.search(stripped) for pat in _TOOL_DENIAL_PATTERNS)
+
+
+def build_tool_output_ignored_nudge() -> str:
+    """System message asking the model to actually use the tool output.
+
+    Pairs with is_tool_output_ignored. No new tool call — the data is
+    already in the message history; we just need the model to read it.
+    """
+    return (
+        "तपाईंको अघिल्लो जवाफले 'भेटिएन / डेटामा छैन / जानकारी छैन' भन्यो, "
+        "तर वास्तवमा tool ले data फर्काएको छ (माथिको tool message मा URL "
+        "हरू सहित बसेको छ)। यो गम्भीर bug हो — user को विश्वास जान्छ। "
+        "अहिले नै tool output पढ्नुहोस्, त्यसमा भएको जानकारी प्रयोग गरेर "
+        "user को प्रश्नको सिधा नेपाली उत्तर लेख्नुहोस् + स्रोत: रेखा। "
+        "'भेटिएन' भन्न बन्द गर्नुहोस् — data त्यहीं छ। कुनै नयाँ tool "
+        "call नगर्नुहोस्।"
+    )
 
 
 def build_tool_narration_nudge() -> str:
