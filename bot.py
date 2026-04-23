@@ -84,6 +84,7 @@ from core.bot_helpers import (
     is_transient_llm_error,
     looks_like_correction,
     needs_tool_use,
+    news_answer_off_topic,
     normalize_digits,
     safe_field_value,
     split_body_and_sources,
@@ -651,15 +652,25 @@ async def on_message(message):
             if response and getattr(response, "choices", None):
                 ai_response = response.choices[0].message.content or ""
 
-            # Empty-promise rescue: the model wrote "म बताउँछु" / "let me
-            # fetch" and stopped — no tool_call, no data. If the user's
-            # query clearly needed a tool, inject a forcing system message
-            # and spend one more LLM turn with tools available.
-            if (
-                is_empty_promise(ai_response, tool_was_used=tool_was_used)
-                and needs_tool_use(chad.user_input)
-                and tools_array
-            ):
+            # Empty-promise rescue (same-turn):
+            # 1. Pure empty promise ("म बताउँछु / I'll fetch") with no tool used
+            #    and the query clearly needed a tool.
+            # 2. User asked for news but the answer looks nothing like news
+            #    (the "tarkari instead of samachar" failure mode). Same
+            #    mechanism — force a tool-call retry with tools=auto.
+            needs_retry = (
+                tools_array
+                and (
+                    (
+                        is_empty_promise(ai_response, tool_was_used=tool_was_used)
+                        and needs_tool_use(chad.user_input)
+                    )
+                    or news_answer_off_topic(
+                        chad.user_input, ai_response, tool_was_used=tool_was_used,
+                    )
+                )
+            )
+            if needs_retry:
                 logger.info(
                     "Empty-promise detected (turn=%s): %r — forcing tool retry.",
                     turn_id, ai_response[:100],

@@ -487,6 +487,72 @@ def needs_tool_use(user_text: str | None) -> bool:
     return any(pat.search(user_text) for pat in _TOOL_NEEDED_PATTERNS)
 
 
+# ── News-shape validator ──────────────────────────────────────────
+#
+# Production failure: user asked for "aja ko taja samachar". Yeti
+# replied with a list of VEGETABLES (interpreted "ताजा समाचार" as
+# "ताजा तरकारी"). Neither the empty-promise detector nor the
+# fabricated-URL detector catches an off-topic but confidently-wrong
+# answer. This pair of helpers does.
+
+_NEWS_REQUEST_PATTERNS: tuple["re.Pattern[str]", ...] = (
+    re.compile(r"\b(samachar|khabar|headline|news|samachaar)\b", re.IGNORECASE),
+    re.compile(r"(समाचार|खबर)"),
+)
+
+
+def user_asked_for_news(user_text: str | None) -> bool:
+    """True if the user's message explicitly asks for news."""
+    if not user_text:
+        return False
+    return any(pat.search(user_text) for pat in _NEWS_REQUEST_PATTERNS)
+
+
+def looks_like_news_answer(answer: str | None) -> bool:
+    """Heuristic: does the answer actually look like a news reply?
+
+    Signals (any one suffices):
+      * Contains an http(s) URL.
+      * Has a `स्रोत:` citation line.
+      * Contains at least two dated-headline-like markers (Devanagari
+        year 2026/2083 near a verb, or ISO date).
+    This is deliberately loose — we only want to catch the cases where
+    the answer is obviously NOT news (vegetables, weather, random
+    chat).
+    """
+    if not answer:
+        return False
+    if URL_RE.search(answer):
+        return True
+    if "स्रोत:" in answer or "स्रोत :" in answer:
+        return True
+    dated_markers = len(
+        re.findall(r"(?:20[0-9]{2}|२०[०-९]{2})", answer)
+    )
+    return dated_markers >= 2
+
+
+def news_answer_off_topic(
+    user_text: str | None,
+    answer: str | None,
+    *,
+    tool_was_used: bool,
+) -> bool:
+    """True when the user asked for news but the answer clearly isn't.
+
+    Only fires when a tool was NOT used — if the tool returned real
+    content and the model still went off-topic, the fabricated-URL /
+    fabricated-filename detectors are the right guards (the tool output
+    is the ground truth there). This is the catch for cases where no
+    tool ran at all.
+    """
+    if tool_was_used:
+        return False
+    if not user_asked_for_news(user_text):
+        return False
+    return not looks_like_news_answer(answer)
+
+
 def build_force_tool_nudge(user_text: str) -> str:
     """System message used to retry after an empty-promise answer.
 

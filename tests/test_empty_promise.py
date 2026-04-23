@@ -13,7 +13,10 @@ from core.bot_helpers import (
     build_force_tool_nudge,
     detect_fabricated_filenames,
     is_empty_promise,
+    looks_like_news_answer,
     needs_tool_use,
+    news_answer_off_topic,
+    user_asked_for_news,
 )
 
 
@@ -127,6 +130,67 @@ class FabricatedFilenamesTests(unittest.TestCase):
     def test_empty_inputs(self) -> None:
         self.assertEqual(detect_fabricated_filenames("", "x"), [])
         self.assertEqual(detect_fabricated_filenames("x", ""), [])
+
+
+class NewsShapeTests(unittest.TestCase):
+    """Guards the 'samachar → tarkari' (vegetables) failure mode."""
+
+    def test_user_asked_for_news_devanagari(self) -> None:
+        self.assertTrue(user_asked_for_news("आजको ताजा समाचार देउ"))
+
+    def test_user_asked_for_news_romanized(self) -> None:
+        self.assertTrue(user_asked_for_news("aja ko taja samachar dinus"))
+
+    def test_small_talk_not_news(self) -> None:
+        self.assertFalse(user_asked_for_news("नमस्ते"))
+        self.assertFalse(user_asked_for_news("k xa"))
+
+    def test_answer_with_url_looks_like_news(self) -> None:
+        self.assertTrue(looks_like_news_answer(
+            "नेप्से २८०० भन्दा तल बन्द।\nस्रोत: https://merolagani.com/x"
+        ))
+
+    def test_vegetable_list_does_not_look_like_news(self) -> None:
+        answer = (
+            "आजका लागि ताजा तरकारीहरू:\nकाउली\nफर्सी\nगाँजर\nगाँड्यौलो"
+        )
+        self.assertFalse(looks_like_news_answer(answer))
+
+    def test_off_topic_fires(self) -> None:
+        # User wanted news, got vegetables, no tool ran → fire retry.
+        self.assertTrue(news_answer_off_topic(
+            "aja ko taja samachar dinus",
+            "आजका लागि ताजा तरकारीहरू:\nकाउली\nफर्सी",
+            tool_was_used=False,
+        ))
+
+    def test_no_fire_when_tool_was_used(self) -> None:
+        # If a tool ran, the fabricated-URL/filename detectors are the
+        # right guards. We don't fire the news-shape check.
+        self.assertFalse(news_answer_off_topic(
+            "aja ko taja samachar",
+            "आजका लागि ताजा तरकारीहरू:\nकाउली",
+            tool_was_used=True,
+        ))
+
+    def test_no_fire_when_user_didnt_ask_for_news(self) -> None:
+        self.assertFalse(news_answer_off_topic(
+            "नमस्ते, kasto xa",
+            "ए हजुर, ठिकै छु।",
+            tool_was_used=False,
+        ))
+
+    def test_news_answer_with_citations_passes(self) -> None:
+        # Real news reply — we must NOT false-positive.
+        answer = (
+            "आज नेपालका मुख्य खबरहरू:\n"
+            "१. नेप्से २८०० भन्दा तल बन्द भयो।\n"
+            "२. सुदूरपश्चिममा विद्युत उपयोग कम।\n\n"
+            "स्रोत:\n- https://merolagani.com/NewsDetail.aspx?newsID=125524"
+        )
+        self.assertFalse(news_answer_off_topic(
+            "aja ko samachar", answer, tool_was_used=True,
+        ))
 
 
 class ForceToolNudgeShapeTests(unittest.TestCase):
