@@ -653,23 +653,100 @@ def detect_fabricated_filenames(answer: str, tool_output: str) -> list[str]:
     return sorted(n for n in answer_names if n not in tool_output)
 
 
+def shorten_for_citation(url: str, *, max_chars: int = 42) -> str:
+    """Return a Discord-markdown link with a short visible label.
+
+    `[myrepublica.com/news](https://myrepublica.nagariknetwork.com/news/...)`
+
+    Discord renders this as an inline clickable label, keeping the
+    citation line readable while preserving the full URL target.
+    Non-URL input is returned unchanged.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return url
+    host = _extract_host(url) or ""
+    import urllib.parse as _up
+    try:
+        parsed = _up.urlparse(url)
+    except Exception:
+        return url
+    path = (parsed.path or "").rstrip("/")
+    label = host
+    if path and len(path) > 1 and len(host) < max_chars - 4:
+        first_seg = path.lstrip("/").split("/", 1)[0]
+        if first_seg:
+            remain = max_chars - len(host) - 1  # '/'
+            if remain > 2:
+                if len(first_seg) > remain:
+                    first_seg = first_seg[: remain - 1] + "…"
+                label = f"{host}/{first_seg}"
+    if len(label) > max_chars:
+        label = label[: max_chars - 1] + "…"
+    return f"[{label}]({url})"
+
+
+def rewrite_sources_as_markdown(answer: str) -> str:
+    """Rewrite bare URLs inside the `स्रोत:` block as Discord-markdown links.
+
+    Only touches lines that are bullets + bare URL (`- https://…`), so
+    Sarvam's own markdown links or surrounding prose stay untouched.
+    """
+    if not answer or "स्रोत:" not in answer:
+        return answer
+    idx = answer.rfind("स्रोत:")
+    body = answer[:idx]
+    sources = answer[idx:]
+    bullet_url_re = re.compile(
+        r"^(\s*[-*•]?\s*\d*\.?\s*)(https?://[^\s)\]\"<>]+)\s*$"
+    )
+    out_lines: list[str] = []
+    for line in sources.split("\n"):
+        m = bullet_url_re.match(line)
+        if m:
+            prefix = m.group(1)
+            url = m.group(2).rstrip(".,;:")
+            out_lines.append(f"{prefix}{shorten_for_citation(url)}")
+        else:
+            out_lines.append(line)
+    return body + "\n".join(out_lines)
+
+
 def ensure_sources_line(
     answer: str,
     citation_urls: Iterable[str],
     *,
     max_urls: int = 3,
 ) -> str:
-    """Append a `स्रोत:` section when the model forgot to cite tool output.
+    """Ensure the `स्रोत:` block actually cites URLs when the tool had some.
 
-    If the answer already contains `स्रोत:`, it is returned unchanged. We only
-    inject when there are citation URLs; otherwise the LLM retry can do
-    better (it may know non-URL source names).
+    Three cases:
+      1. No `स्रोत:` header at all → append one with shortened URLs.
+      2. `स्रोत:` header present AND already contains URLs → leave alone.
+      3. `स्रोत:` header present but has NO URLs (e.g. the model wrote
+         "स्रोत: नेपालOSINT" with no links) → rewrite the block to include
+         the real tool URLs so citations are actually clickable.
+
+    Case 3 matters because Sarvam likes to write "स्रोत: NepalOSINT" as a
+    flat name which satisfies the validator but gives the user nothing
+    verifiable.
     """
-    if not answer or "स्रोत:" in answer:
+    if not answer:
         return answer
-    urls = [u for u in citation_urls if u][:max_urls]
+    urls = [u.rstrip(".,;:") for u in citation_urls if u][:max_urls]
+    urls = [u for u in urls if u]
     if not urls:
         return answer
-    body = answer.rstrip()
-    lines = "\n".join(f"- {u}" for u in urls)
-    return f"{body}\n\nस्रोत:\n{lines}"
+
+    if "स्रोत:" not in answer:
+        body = answer.rstrip()
+        lines = "\n".join(f"- {shorten_for_citation(u)}" for u in urls)
+        return f"{body}\n\nस्रोत:\n{lines}"
+
+    # Case 3 detection: a स्रोत: block exists but contains no URL.
+    idx = answer.rfind("स्रोत:")
+    body_before = answer[:idx].rstrip()
+    sources_block = answer[idx:]
+    if URL_RE.search(sources_block):
+        return answer  # Already has URLs, leave it.
+    lines = "\n".join(f"- {shorten_for_citation(u)}" for u in urls)
+    return f"{body_before}\n\nस्रोत:\n{lines}"

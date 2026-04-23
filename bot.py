@@ -86,6 +86,7 @@ from core.bot_helpers import (
     needs_tool_use,
     news_answer_off_topic,
     normalize_digits,
+    rewrite_sources_as_markdown,
     safe_field_value,
     split_body_and_sources,
     tool_calls_signature,
@@ -818,6 +819,9 @@ async def on_message(message):
                 ai_response = normalize_digits(ai_response)
                 if tool_was_used:
                     ai_response = ensure_sources_line(ai_response, citation_urls)
+                # Shorten any bare URLs in the स्रोत: block to Discord-markdown
+                # links regardless of who wrote the block (model or helper).
+                ai_response = rewrite_sources_as_markdown(ai_response)
 
                 # Re-validate *after* fixups: if the only problems were
                 # ASCII digits and a missing स्रोत line, we've just solved

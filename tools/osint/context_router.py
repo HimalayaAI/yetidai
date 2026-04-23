@@ -200,6 +200,15 @@ GOVT_KEYWORDS = {
     "सूचना",
     "मन्त्रिपरिषद्",
     "क्याबिनेट",
+    # Standalone romanized forms — users say "govt ko decision" or
+    # even misspelt "decisons" in live chat; we should still route
+    # to the government intent.
+    "govt",
+    "decision",
+    "decisions",
+    "decisons",   # common misspelling seen in logs
+    "nirnaya",
+    "naya nirnaya",
 }
 
 DEBT_KEYWORDS = {
