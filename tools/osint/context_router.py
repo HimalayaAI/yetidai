@@ -172,6 +172,16 @@ MACRO_KEYWORDS = {
     "t-bill",
     "interbank",
     "bank rate",
+    # GDP / per-capita — OSINT's economy snapshot doesn't cover GDP
+    # directly (it tracks fiscal position + BoP + monetary), but the
+    # route is still correct: `macro` is the intent the LLM should use,
+    # which composes with an `internet_search` call for GDP stats.
+    "gdp",
+    "per capita",
+    "per-capita",
+    "growth rate",
+    "जीडीपी",
+    "कुल गार्हस्थ्य उत्पादन",
     "मुद्रास्फीति",
     "रेमिट्यान्स",
     "विदेशी मुद्रा",
@@ -318,6 +328,65 @@ WHO_IS_KEYWORDS = {
     "ko hunuhuncha",
     "nam ke",
 }
+
+
+# Minister role abbreviations / variants → canonical role tag. When any
+# of these appears in the query the router marks it as a government
+# query (so OSINT hits /govt-decisions + /announcements + /search) and
+# a follow-up `focus` hint can be built from the canonical role. Kept
+# here (not in GOVT_KEYWORDS) so an HM query isn't misread as a
+# cabinet-meeting query.
+MINISTER_ROLE_VARIANTS: dict[str, str] = {
+    # Prime Minister
+    "pm": "prime_minister",
+    "प्रधानमन्त्री": "prime_minister",
+    "pradhanmantri": "prime_minister",
+    "pradanmantri": "prime_minister",
+    # Home Minister
+    "hm": "home_minister",
+    "home minister": "home_minister",
+    "गृहमन्त्री": "home_minister",
+    "grihamantri": "home_minister",
+    "griha mantri": "home_minister",
+    # Finance Minister
+    "finance minister": "finance_minister",
+    "अर्थमन्त्री": "finance_minister",
+    "arthamantri": "finance_minister",
+    "artha mantri": "finance_minister",
+    # Foreign Minister
+    "foreign minister": "foreign_minister",
+    "परराष्ट्रमन्त्री": "foreign_minister",
+    "pararastramantri": "foreign_minister",
+    # Deputy PM
+    "dpm": "deputy_prime_minister",
+    "deputy prime minister": "deputy_prime_minister",
+    "उपप्रधानमन्त्री": "deputy_prime_minister",
+    # Defence / Education / Health / Energy — add on demand
+    "defence minister": "defence_minister",
+    "defense minister": "defence_minister",
+    "रक्षामन्त्री": "defence_minister",
+    "education minister": "education_minister",
+    "शिक्षामन्त्री": "education_minister",
+    "health minister": "health_minister",
+    "स्वास्थ्यमन्त्री": "health_minister",
+    "energy minister": "energy_minister",
+    "ऊर्जामन्त्री": "energy_minister",
+}
+
+
+def detect_minister_role(query: str) -> str | None:
+    """Return canonical role tag (e.g. 'home_minister') if the query
+    names a specific minister role via abbreviation or full form. None
+    otherwise. Short ASCII abbreviations (PM/HM/DPM) match on word
+    boundary so they don't false-hit inside 'HMong' etc.
+    """
+    if not query:
+        return None
+    normalized = query.lower()
+    for variant, role in MINISTER_ROLE_VARIANTS.items():
+        if _keyword_matches(normalized, variant):
+            return role
+    return None
 
 ROMANIZED_GENERAL_PATTERNS = (
     "aja ko news",
@@ -541,6 +610,13 @@ def route_query(query: str) -> RoutePlan:
     is_trading = _contains_any(normalized, TRADING_KEYWORDS) or is_ticker_like
     is_general_news = _contains_any(normalized, GENERAL_KEYWORDS) or has_romanized_general
     is_who_is = _contains_any(normalized, WHO_IS_KEYWORDS)
+    # If the query names a specific minister role (PM/HM/DPM/...),
+    # promote the government intent AND mark it as a who_is query so
+    # OSINT fans out to identity search.
+    minister_role = detect_minister_role(query)
+    if minister_role:
+        is_government = True
+        is_who_is = True
     start_date, end_date = _extract_history_range(query)
     has_explicit_history_range = bool(start_date and end_date)
     wants_history = _contains_any(normalized, HISTORY_KEYWORDS) or has_explicit_history_range
