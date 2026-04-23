@@ -434,6 +434,14 @@ _EMPTY_PROMISE_PATTERNS: tuple["re.Pattern[str]", ...] = (
         r"i ?(will|'ll|'d) (fetch|search|check|look|provide|get|tell|help|analyze|see|bring|find)",
         re.IGNORECASE,
     ),
+    # "मलाई ... खोज्न दिनुहोस्" — permissive/imperative phrasing that
+    # functions as an empty promise. Observed: PM query returned only
+    # "तपाईँले नेपालको वर्तमान प्रधानमन्त्री को हो भनेर सोध्दै हुनुहुन्छ।
+    # मलाई त्यो जानकारी खोज्न दिनुहोस्।" — classic "let me go find out"
+    # shape that the म-X-छु patterns miss entirely.
+    re.compile(r"मलाई\s+.{0,80}(?:खोज्न|पत्ता\s+लगाउन|हेर्न|बताउन)\s+दिनु"),
+    # Ditto "म ... खोज्न चाहन्छु / हेर्न चाहन्छु" (I want to search).
+    re.compile(r"म\s+.{0,80}(?:खोज्न|हेर्न|पत्ता\s+लगाउन)\s+चाहन्छु"),
 )
 
 # Short reply + any promise pattern is the smoking-gun shape. Long
