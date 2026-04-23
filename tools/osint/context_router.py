@@ -53,10 +53,13 @@ _NEPSE_TICKERS: frozenset[str] = frozenset({
     "LBBL", "LSL", "PRVU", "ADBL",
     # Development banks
     "JBBL", "SADBL", "EDBL", "KSBBL", "SHINE", "SINDU", "LBL",
-    # Insurance (life + non-life)
+    # Insurance (life + non-life, including reinsurance)
     "NLICL", "LICN", "NLG", "NLGF", "NICL", "PICL", "PRIN", "SICL", "SIC",
     "SLIC", "SLICL", "UIC", "ALICL", "CLI", "EIC", "GILB", "HEI", "HGI",
     "LEC", "SGIC", "IGI", "NLIC", "NIL",
+    "HRL",  # Himalayan Reinsurance — asked for in production, had been missed
+    "NRIC", "NICL", "NIL", "SHLB", "RBCL", "LICN",
+    "UAIL", "UNHPL", "CLI", "HGI", "EIC", "PRUDEN", "ALICL", "ALIC",
     # Hydropower
     "UPPER", "API", "AHPC", "CHCL", "HPPL", "HPCL", "NHPC", "NHDL", "NYADI",
     "RADHI", "RHPL", "SHPC", "SHIVM", "TRH", "TAMOR", "TVCL", "SSHL", "SPDL",
@@ -120,6 +123,21 @@ GENERAL_KEYWORDS = {
     "updates",
     "summary",
     "news",
+    # Romanized Nepali — these were missing pre-bef8e9d and caused
+    # "aja ko samachar bhanus" to be silently classified as non-news,
+    # which led Sarvam to hallucinate fake gov.np URLs.
+    "samachar",
+    "samachaar",
+    "samacharharu",
+    "khabar",
+    "khabarharu",
+    "aja",
+    "aaja",
+    "aaj",
+    "aajko",
+    "headline",
+    "headlines",
+    # Devanagari
     "समाचार",
     "आज",
     "अहिले",
@@ -297,10 +315,26 @@ ROMANIZED_GENERAL_PATTERNS = (
     "aaja ko news",
     "today ko news",
     "news bhanus",
-    "news bhanus",
+    "news bhana",
     "news summary",
     "daily briefing",
     "news briefing",
+    # romanized news requests with the Nepali word for "news"
+    "aja ko samachar",
+    "aaja ko samachar",
+    "aaj ko samachar",
+    "aja ko khabar",
+    "aaja ko khabar",
+    "aaj ko khabar",
+    "samachar bhanus",
+    "samachar bhana",
+    "samachar sunau",
+    "khabar bhanus",
+    "khabar bhana",
+    "khabar sunau",
+    "headline bhanus",
+    "headlines suna",
+    # conversational "what happened"
     "k bhairacha",
     "ke bhairacha",
     "k bhaira cha",

@@ -96,9 +96,23 @@ GITHUB_SPEC = ToolSpec(
             type="string",
             description=(
                 "Optional branch or tag name. Defaults to the repo's "
-                "default branch."
+                "default branch. Also parsed automatically from "
+                "`/tree/<branch>` and `/blob/<branch>/...` URLs."
             ),
             required=False,
+        ),
+        ToolParam(
+            name="commit_sha",
+            type="string",
+            description=(
+                "Optional commit SHA. When set (or when `repo` is a "
+                "`.../commit/<sha>` URL), the tool returns commit "
+                "metadata + message + changed-file list instead of the "
+                "repo overview. Use this for 'what changed in this "
+                "commit' questions."
+            ),
+            required=False,
+            examples=["cb3a55be60ee0c9ffaad01e93b4493f694849731"],
         ),
     ],
     timeout_seconds=20.0,
@@ -107,24 +121,56 @@ GITHUB_SPEC = ToolSpec(
 
 # ── URL / identifier parsing ──────────────────────────────────────
 
+# Tolerant URL parser. Accepts all the GitHub URL shapes users paste:
+#   github.com/owner/name
+#   github.com/owner/name/tree/<branch>
+#   github.com/owner/name/blob/<branch>/path/to/file
+#   github.com/owner/name/commit/<sha>
+#   github.com/owner/name/pull/<n>
+#   github.com/owner/name/issues/<n>
 _GITHUB_URL_RE = re.compile(
-    r"^(?:https?://)?(?:www\.)?github\.com/([\w.-]+)/([\w.-]+?)"
-    r"(?:\.git)?(?:/tree/([^/?#]+))?/?(?:[?#].*)?$",
+    r"^(?:https?://)?(?:www\.)?github\.com/"
+    r"(?P<owner>[\w.-]+)/"
+    r"(?P<name>[\w.-]+?)(?:\.git)?"
+    r"(?:/(?P<kind>tree|blob|commit|commits|pull|pulls|issues)/(?P<ref>[^/?#]+)(?:/(?P<sub>[^?#]*))?)?"
+    r"/?(?:[?#].*)?$",
     re.IGNORECASE,
 )
 _OWNER_REPO_RE = re.compile(r"^([\w.-]+)/([\w.-]+)$")
 
 
-def _parse_repo(raw: str) -> tuple[str, str, str | None]:
-    """Return (owner, repo, branch) from a URL or owner/name string."""
+def _parse_repo(raw: str) -> tuple[str, str, str | None, str | None, str | None]:
+    """Return (owner, name, branch, commit_sha, file_path).
+
+    Commit URLs set `commit_sha` (branch/file_path stay None). `blob/<ref>/path`
+    URLs set both `branch` and `file_path`. Pull-request / issue URLs set
+    nothing extra — the caller falls back to the default repo view.
+    """
     raw = (raw or "").strip().rstrip("/")
     m = _GITHUB_URL_RE.match(raw)
     if m:
-        owner, name, branch = m.group(1), m.group(2), m.group(3)
-        return owner, name, branch
+        owner = m.group("owner")
+        name = m.group("name")
+        kind = (m.group("kind") or "").lower()
+        ref = m.group("ref")
+        sub = m.group("sub")
+        branch: str | None = None
+        commit_sha: str | None = None
+        file_path: str | None = None
+        if kind == "tree":
+            branch = ref
+        elif kind == "blob":
+            branch = ref
+            file_path = sub
+        elif kind in ("commit", "commits"):
+            commit_sha = ref
+        # pull/issues: we only keep owner/name; the specific number isn't
+        # actionable through the repo endpoints, and analyze_github_repo
+        # doesn't claim to read PR/issue bodies.
+        return owner, name, branch, commit_sha, file_path
     m = _OWNER_REPO_RE.match(raw)
     if m:
-        return m.group(1), m.group(2), None
+        return m.group(1), m.group(2), None, None, None
     raise ValueError(f"unrecognised repo identifier: {raw!r}")
 
 
@@ -215,12 +261,13 @@ async def handle_github(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResu
         return ToolResult(tool_id=GITHUB_SPEC.tool_id, success=False, error="Missing repo")
 
     try:
-        owner, name, branch_from_url = _parse_repo(repo_raw)
+        owner, name, branch_from_url, commit_from_url, path_from_url = _parse_repo(repo_raw)
     except ValueError as exc:
         return ToolResult(tool_id=GITHUB_SPEC.tool_id, success=False, error=str(exc))
 
     branch = (arguments.get("branch") or branch_from_url or "").strip() or None
-    file_path = (arguments.get("file_path") or "").strip() or None
+    file_path = (arguments.get("file_path") or path_from_url or "").strip() or None
+    commit_sha = (arguments.get("commit_sha") or commit_from_url or "").strip() or None
 
     try:
         async with httpx.AsyncClient() as client:
@@ -244,6 +291,60 @@ async def handle_github(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResu
             meta_resp.raise_for_status()
             meta = meta_resp.json()
             branch = branch or meta.get("default_branch") or "main"
+
+            # Commit mode — return commit metadata + message + changed-file list.
+            # Triggered when the URL is .../commit/<sha>, or when the caller
+            # passed commit_sha explicitly. Answers "यो commit मा के change छ?".
+            if commit_sha:
+                commit_resp = await _api_get(
+                    client, f"/repos/{owner}/{name}/commits/{commit_sha}",
+                )
+                if commit_resp.status_code == 404:
+                    return ToolResult(
+                        tool_id=GITHUB_SPEC.tool_id,
+                        success=False,
+                        error=f"commit not found: {commit_sha}",
+                    )
+                commit_resp.raise_for_status()
+                commit = commit_resp.json()
+                info = commit.get("commit", {}) or {}
+                author = (info.get("author") or {}).get("name") or "—"
+                date_s = (info.get("author") or {}).get("date") or "—"
+                message = info.get("message") or ""
+                stats = commit.get("stats") or {}
+                files = commit.get("files") or []
+                file_lines: list[str] = []
+                for f in files[:30]:
+                    status = f.get("status", "?")
+                    path = f.get("filename", "?")
+                    additions = f.get("additions", 0)
+                    deletions = f.get("deletions", 0)
+                    file_lines.append(
+                        f"  [{status}] {path}  (+{additions} / -{deletions})"
+                    )
+                if len(files) > 30:
+                    file_lines.append(f"  … ({len(files) - 30} more files)")
+                block = (
+                    f"{_format_metadata(meta)}\n\n"
+                    f"──── commit {commit_sha[:12]} ────\n"
+                    f"Author: {author}  |  Date: {date_s}\n"
+                    f"Stats: +{stats.get('additions', 0)} / "
+                    f"-{stats.get('deletions', 0)}  |  "
+                    f"{len(files)} files changed\n\n"
+                    f"Message:\n{_truncate(message, 1200)}\n\n"
+                    f"Files:\n" + ("\n".join(file_lines) if file_lines else "  (no files listed)")
+                )
+                return ToolResult(
+                    tool_id=GITHUB_SPEC.tool_id,
+                    success=True,
+                    content=block,
+                    meta={
+                        "owner": owner,
+                        "repo": name,
+                        "commit_sha": commit_sha,
+                        "files_changed": len(files),
+                    },
+                )
 
             # Specific file mode — skip tree + README to save rate-limit tokens.
             if file_path:

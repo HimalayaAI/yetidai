@@ -405,15 +405,23 @@ def build_correction_nudge(
 # that shape so bot.py can inject a forcing nudge and retry once.
 
 _EMPTY_PROMISE_PATTERNS: tuple["re.Pattern[str]", ...] = (
-    re.compile(r"म .{0,40}बताउँछु"),         # "म समाचार बताउँछु"
-    re.compile(r"म .{0,40}सुनाउँछु"),          # "म खबर सुनाउँछु"
-    re.compile(r"म .{0,40}भन्छु"),            # "म भन्छु"
-    re.compile(r"म .{0,40}दिन्छु"),            # "म जानकारी दिन्छु"
-    re.compile(r"म .{0,40}प्रदान गर्छु"),       # "म समाचार प्रदान गर्छु"
-    re.compile(r"म .{0,40}पठाउँछु"),          # "म पठाउँछु"
-    re.compile(r"let me (fetch|search|check|look)", re.IGNORECASE),
-    re.compile(r"i ?(will|'ll) (fetch|search|check|look|provide|get|tell)", re.IGNORECASE),
-    re.compile(r"तपाईंलाई .{0,40}(बताउँछु|सुनाउँछु|दिन्छु|पठाउँछु)"),
+    re.compile(r"म .{0,40}बताउँछु"),               # "म समाचार बताउँछु"
+    re.compile(r"म .{0,40}सुनाउँछु"),                # "म खबर सुनाउँछु"
+    re.compile(r"म .{0,40}भन्छु"),                  # "म भन्छु"
+    re.compile(r"म .{0,40}दिन्छु"),                  # "म जानकारी दिन्छु"
+    re.compile(r"म .{0,40}प्रदान गर्छु"),             # "म समाचार प्रदान गर्छु"
+    re.compile(r"म .{0,40}पठाउँछु"),                # "म पठाउँछु"
+    # Future-tense "will do / will help / will look" — the GitHub-commit
+    # trace landed on "help गर्नेछु" which the earlier pattern set missed.
+    re.compile(r"म .{0,60}(?:गर्नेछु|गर्छु|हेर्नेछु|हेर्छु)"),
+    re.compile(r"तपाईं(?:ँ|ले|लाई).{0,60}(?:बताउँछु|सुनाउँछु|दिन्छु|पठाउँछु|"
+               r"गर्नेछु|गर्छु|हेर्नेछु|हेर्छु)"),
+    re.compile(r"help गर्(?:छु|नेछु)", re.IGNORECASE),
+    re.compile(r"let me (fetch|search|check|look|see|analyze)", re.IGNORECASE),
+    re.compile(
+        r"i ?(will|'ll|'d) (fetch|search|check|look|provide|get|tell|help|analyze|see)",
+        re.IGNORECASE,
+    ),
 )
 
 # Short reply + any promise pattern is the smoking-gun shape. Long
@@ -499,6 +507,62 @@ def build_force_tool_nudge(user_text: str) -> str:
 _FILENAME_IN_ANSWER_RE = re.compile(
     r"\b([\w.\-]+\.(?:py|md|ts|tsx|js|jsx|json|yaml|yml|toml|txt|rs|go|java|kt|rb|c|cpp|h|sh))\b"
 )
+
+
+def detect_fabricated_urls(answer: str, tool_output: str) -> list[str]:
+    """Return URLs cited in `answer` whose host doesn't appear in `tool_output`.
+
+    Catches the "Sarvam cites https://nprc.gov.np/ but the tool output
+    contains no such URL and no such host" class of hallucination. We
+    check by host (not full URL) because real tools often cite an
+    article URL while Sarvam paraphrases to the homepage — same host
+    is fine, different host is fabrication.
+    """
+    if not answer or not tool_output:
+        return []
+    answer_urls = URL_RE.findall(answer)
+    if not answer_urls:
+        return []
+    # Collect all hostnames from the tool output, case-insensitive.
+    tool_hosts: set[str] = set()
+    for m in URL_RE.finditer(tool_output):
+        host = _extract_host(m.group(0))
+        if host:
+            tool_hosts.add(host.lower())
+    if not tool_hosts:
+        # No URLs in the tool output — every URL in the answer is suspicious.
+        # Return them so the caller can decide to nuke the citations.
+        return sorted({u.rstrip(".,;:") for u in answer_urls})
+    bad: list[str] = []
+    for url in answer_urls:
+        url = url.rstrip(".,;:")
+        host = _extract_host(url)
+        if host and host.lower() not in tool_hosts:
+            bad.append(url)
+    # Dedupe while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for u in bad:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return unique
+
+
+def _extract_host(url: str) -> str | None:
+    """Parse a hostname out of a URL, tolerating minor malformations."""
+    try:
+        import urllib.parse
+        parsed = urllib.parse.urlparse(url.strip())
+        host = (parsed.hostname or "").strip()
+        # Strip a leading "www." so api.example.com and www.example.com
+        # don't trip the detector when the real tool quoted one and
+        # the model wrote the other.
+        if host.startswith("www."):
+            host = host[4:]
+        return host or None
+    except Exception:
+        return None
 
 
 def detect_fabricated_filenames(answer: str, tool_output: str) -> list[str]:

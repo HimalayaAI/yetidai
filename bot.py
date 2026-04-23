@@ -58,6 +58,7 @@ from core.tool_registry import get_registry
 from core.tool_contracts import ToolContext, ToolResult
 from core.output_validator import validate_answer, build_fix_message
 from core.request_log import log_turn
+from core.nepali_date import format_bs_ne, format_bs_iso
 from core.bot_helpers import (
     DISCORD_EMBED_FOOTER_LIMIT,
     DISCORD_MSG_LIMIT,
@@ -71,6 +72,7 @@ from core.bot_helpers import (
     chunk_for_discord,
     classify_llm_error,
     detect_fabricated_filenames,
+    detect_fabricated_urls,
     detect_requested_count,
     ensure_sources_line,
     extract_urls,
@@ -346,9 +348,20 @@ async def on_message(message):
                 message.channel, limit=5,
             )
 
-            today_str = datetime.date.today().strftime("%Y-%m-%d")
+            today = datetime.date.today()
+            today_str = today.strftime("%Y-%m-%d")
+            # Inject a concrete BS date so Sarvam doesn't hallucinate the
+            # Nepali calendar when asked "आज भन्नाले कहिले हो?". Falls
+            # back to AD-only if nepali-datetime isn't installed.
+            bs_ne = format_bs_ne(today)
+            bs_iso = format_bs_iso(today)
+            bs_line = ""
+            if bs_ne and bs_iso:
+                bs_line = f"\nBikram Sambat: {bs_iso} ({bs_ne})"
             dynamic_system_prompt = (
-                f"{SYSTEM_PROMPT}\n\n# CURRENT DATE:\nToday's Date is: {today_str}"
+                f"{SYSTEM_PROMPT}\n\n# CURRENT DATE:\n"
+                f"Today's Date (AD): {today_str}{bs_line}\n"
+                f"Use these dates as ground truth — do not hallucinate the BS date."
             )
             messages = [{"role": "system", "content": dynamic_system_prompt}]
 
@@ -756,22 +769,33 @@ async def on_message(message):
             and tool_output_accum
         ):
             joined_output = "\n".join(tool_output_accum)
-            fabricated = detect_fabricated_filenames(ai_response, joined_output)
-            if fabricated:
+            fabricated_files = detect_fabricated_filenames(ai_response, joined_output)
+            fabricated_urls = detect_fabricated_urls(ai_response, joined_output)
+            if fabricated_files or fabricated_urls:
                 logger.info(
-                    "Fabricated filenames in answer (turn=%s): %s — retrying once.",
-                    turn_id, fabricated,
+                    "Fabrication in answer (turn=%s): files=%s urls=%s — retrying.",
+                    turn_id, fabricated_files, fabricated_urls,
+                )
+                parts = []
+                if fabricated_files:
+                    parts.append(
+                        f"यी फाइल नामहरू tool output मा छैनन्: "
+                        f"{', '.join(fabricated_files)}"
+                    )
+                if fabricated_urls:
+                    parts.append(
+                        f"यी URL tool output मा छैनन् (hallucinated): "
+                        f"{', '.join(fabricated_urls)}"
+                    )
+                nudge = (
+                    " | ".join(parts)
+                    + "। यी काल्पनिक हुन्। पुनः लेख्नुहोस्, केवल tool output "
+                    "मा देखिएका real file / real URL मात्र उद्धरण गर्नुहोस्। "
+                    "यदि tool output मा citable URL छैन भने स्रोत: रेखामा "
+                    "endpoint नाम मात्र राख्नुहोस् — काल्पनिक URL नलेख्नुहोस्।"
                 )
                 messages.append({"role": "assistant", "content": ai_response})
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        f"तपाईंको जवाफमा यी फाइल नामहरू छन् जुन tool output मा "
-                        f"छैनन्: {', '.join(fabricated)}। यी काल्पनिक हुन् — "
-                        "hallucination। पुनः लेख्नुहोस्, केवल tool output मा "
-                        "देखिएका फाइल / feature मात्र उल्लेख गर्नुहोस्।"
-                    ),
-                })
+                messages.append({"role": "system", "content": nudge})
                 try:
                     anti_resp = await _run_llm_turn(
                         messages, tools_array=None, tool_choice=None,
