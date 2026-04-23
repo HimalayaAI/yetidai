@@ -980,9 +980,21 @@ async def on_message(message):
         # ── Deterministic fixups + validator retry (non-fatal) ────
         if ai_response and llm_exc is None:
             try:
+                # Track whether a github tool fired this turn — the
+                # validator uses this to catch fabricated
+                # `github.com/HimalayaAI/<repo>` URLs in the final answer.
+                github_tool_was_used = any(
+                    entry.get("name") in ("analyze_github_repo", "list_github_repos")
+                    for entry in tool_calls_log
+                )
+
                 # Check pre-fix state so we can distinguish "model was fine"
                 # from "fixups rescued it" in the log.
-                pre_issues = validate_answer(ai_response, tool_was_used=tool_was_used)
+                pre_issues = validate_answer(
+                    ai_response,
+                    tool_was_used=tool_was_used,
+                    github_tool_was_used=github_tool_was_used,
+                )
 
                 # Mechanical fixes first — cheap, don't need the LLM.
                 ai_response = normalize_digits(ai_response)
@@ -995,7 +1007,11 @@ async def on_message(message):
                 # Re-validate *after* fixups: if the only problems were
                 # ASCII digits and a missing स्रोत line, we've just solved
                 # them without burning a Sarvam call.
-                post_issues = validate_answer(ai_response, tool_was_used=tool_was_used)
+                post_issues = validate_answer(
+                    ai_response,
+                    tool_was_used=tool_was_used,
+                    github_tool_was_used=github_tool_was_used,
+                )
 
                 if post_issues:
                     logger.info(

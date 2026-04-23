@@ -45,6 +45,13 @@ REQUEST_TIMEOUT = 10.0
 MAX_README_CHARS = 3200
 MAX_TREE_ENTRIES = 60
 MAX_FILE_CHARS = 4000
+MAX_LISTED_REPOS = 30
+
+# Default org for "our code / the repo" style questions. Keeping it here
+# (not in the system prompt) means the LLM cannot be tricked into asking
+# for an arbitrary org's repos by prompt injection — list_github_repos
+# only answers for this org unless the caller explicitly overrides.
+DEFAULT_ORG = "HimalayaAI"
 
 
 GITHUB_SPEC = ToolSpec(
@@ -116,6 +123,37 @@ GITHUB_SPEC = ToolSpec(
         ),
     ],
     timeout_seconds=20.0,
+)
+
+
+LIST_REPOS_SPEC = ToolSpec(
+    tool_id="github.list_org_repos",
+    name="list_github_repos",
+    description=(
+        "List public repositories for a GitHub organization or user. "
+        f"Defaults to the official HARL org (`{DEFAULT_ORG}`). Call this "
+        "when the user asks for 'your repo / the code / HARL github / "
+        "सबै repo / कोड कहाँ छ / list of repos'. Returns name + URL + "
+        "short description for each repo, sorted by recent push.\n\n"
+        "USE THIS — NEVER fabricate a `github.com/<org>/<repo>` URL from "
+        "memory. `github.com/HimalayaAI` is only the org index page; the "
+        "repos under it must come from this tool."
+    ),
+    category=ToolCategory.UTILITY,
+    parameters=[
+        ToolParam(
+            name="org",
+            type="string",
+            description=(
+                f"GitHub org or username. Defaults to `{DEFAULT_ORG}` when "
+                "omitted. Pass a different value only if the user "
+                "explicitly asks about another org."
+            ),
+            required=False,
+            examples=[DEFAULT_ORG, "anthropics"],
+        ),
+    ],
+    timeout_seconds=15.0,
 )
 
 
@@ -253,6 +291,103 @@ def _decode_content(payload: dict[str, Any]) -> str:
     return raw
 
 
+# ── Org-listing helpers ───────────────────────────────────────────
+
+async def _fetch_org_repos(
+    client: httpx.AsyncClient, owner: str,
+) -> tuple[bool, list[dict[str, Any]], str | None]:
+    """Return (ok, repos, error).
+
+    Hits `/orgs/<owner>/repos` first (the canonical endpoint for orgs).
+    If that 404s — meaning `<owner>` is a user account, not an org —
+    falls back to `/users/<owner>/repos`. Either way the caller gets
+    the full public-repo list without caring which account type it is.
+    """
+    for path in (f"/orgs/{owner}/repos", f"/users/{owner}/repos"):
+        resp = await _api_get(
+            client, path, params={"per_page": 100, "type": "public", "sort": "pushed"},
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return True, data if isinstance(data, list) else [], None
+        if resp.status_code == 404:
+            continue
+        if resp.status_code == 403:
+            rl = resp.headers.get("x-ratelimit-remaining")
+            return False, [], (
+                f"GitHub rate limit hit (remaining={rl}). "
+                "Set GITHUB_TOKEN to raise the limit."
+            )
+        return False, [], f"GitHub API HTTP {resp.status_code} for {path}"
+    return False, [], f"account not found: {owner}"
+
+
+def _format_repo_list(owner: str, repos: list[dict[str, Any]]) -> str:
+    if not repos:
+        return (
+            f"No public repositories found under {owner}. "
+            f"Org page: https://github.com/{owner}"
+        )
+    lines = [
+        f"Public repositories under https://github.com/{owner} "
+        f"(showing {min(len(repos), MAX_LISTED_REPOS)} of {len(repos)}, "
+        "newest-pushed first):"
+    ]
+    for r in repos[:MAX_LISTED_REPOS]:
+        name = r.get("name", "")
+        html_url = r.get("html_url", f"https://github.com/{owner}/{name}")
+        desc = (r.get("description") or "").strip()
+        lang = r.get("language") or ""
+        stars = r.get("stargazers_count") or 0
+        meta_bits = [b for b in (lang, f"★{stars}" if stars else "") if b]
+        meta_str = f" [{' · '.join(meta_bits)}]" if meta_bits else ""
+        if desc:
+            lines.append(f"- {name}{meta_str} — {html_url} — {desc}")
+        else:
+            lines.append(f"- {name}{meta_str} — {html_url}")
+    if len(repos) > MAX_LISTED_REPOS:
+        lines.append(
+            f"… ({len(repos) - MAX_LISTED_REPOS} more; see "
+            f"https://github.com/{owner})"
+        )
+    lines.append(f"\nOfficial org page: https://github.com/{owner}")
+    return "\n".join(lines)
+
+
+async def handle_list_repos(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    org = (arguments.get("org") or DEFAULT_ORG).strip() or DEFAULT_ORG
+    # Guard: only allow the GitHub username char-set. Rejects weird inputs
+    # that could be confused with API paths.
+    if not re.fullmatch(r"[\w.-]+", org):
+        return ToolResult(
+            tool_id=LIST_REPOS_SPEC.tool_id,
+            success=False,
+            error=f"invalid org name: {org!r}",
+        )
+    try:
+        async with httpx.AsyncClient() as client:
+            ok, repos, err = await _fetch_org_repos(client, org)
+        if not ok:
+            return ToolResult(
+                tool_id=LIST_REPOS_SPEC.tool_id,
+                success=False,
+                error=err or f"could not fetch repos for {org}",
+            )
+        return ToolResult(
+            tool_id=LIST_REPOS_SPEC.tool_id,
+            success=True,
+            content=_format_repo_list(org, repos),
+            meta={"org": org, "count": len(repos)},
+        )
+    except Exception as exc:
+        logger.exception("list_github_repos failed")
+        return ToolResult(
+            tool_id=LIST_REPOS_SPEC.tool_id,
+            success=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
 # ── Handler ───────────────────────────────────────────────────────
 
 async def handle_github(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResult:
@@ -273,10 +408,28 @@ async def handle_github(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResu
         async with httpx.AsyncClient() as client:
             meta_resp = await _api_get(client, f"/repos/{owner}/{name}")
             if meta_resp.status_code == 404:
+                # Self-correction: a repo under a known account often 404s
+                # because the LLM fabricated the name. Include the real
+                # sibling-repo list so the next turn can recover without
+                # another tool round-trip.
+                siblings_ok, siblings, _ = await _fetch_org_repos(client, owner)
+                hint = (
+                    "\n\n" + _format_repo_list(owner, siblings)
+                    if siblings_ok else ""
+                )
+                # Success=True so the content (not the error) reaches the
+                # LLM via to_tool_message — ToolResult serialises `content`
+                # only on success. The meta flag lets callers still see it
+                # was a miss.
                 return ToolResult(
                     tool_id=GITHUB_SPEC.tool_id,
-                    success=False,
-                    error=f"repo not found or private: {owner}/{name}",
+                    success=True,
+                    content=(
+                        f"Repo DOES NOT EXIST: {owner}/{name} is not a "
+                        f"public repository. Do NOT fabricate a URL for "
+                        f"it in the final answer.{hint}"
+                    ),
+                    meta={"owner": owner, "repo": name, "not_found": True},
                 )
             if meta_resp.status_code == 403:
                 rl = meta_resp.headers.get("x-ratelimit-remaining")
@@ -431,3 +584,4 @@ async def handle_github(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResu
 
 def register() -> None:
     get_registry().register(GITHUB_SPEC, handle_github)
+    get_registry().register(LIST_REPOS_SPEC, handle_list_repos)

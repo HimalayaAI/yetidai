@@ -42,6 +42,14 @@ _LOANWORD_BOUNDARY_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Matches `github.com/HimalayaAI/<suffix>` where <suffix> is a potential
+# repo segment. The bare org URL `github.com/HimalayaAI` (no suffix) is
+# legitimate — only a suffix is suspicious without tool verification.
+_HIMALAYAAI_REPO_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/HimalayaAI/[\w.-]+",
+    flags=re.IGNORECASE,
+)
+
 
 def _ascii_run_length(text: str) -> int:
     """Length of the longest stretch of Latin-script prose between Devanagari.
@@ -77,9 +85,16 @@ def validate_answer(
     answer: str,
     *,
     tool_was_used: bool,
+    github_tool_was_used: bool = True,
     min_devanagari_chars: int = 15,
 ) -> list[str]:
-    """Return a list of Nepali fix instructions. Empty list = all good."""
+    """Return a list of Nepali fix instructions. Empty list = all good.
+
+    `github_tool_was_used` defaults to True so callers that do not know
+    how to thread the flag preserve previous behavior. Pass False when
+    no github tool ran this turn — the validator will then flag any
+    `github.com/HimalayaAI/<suffix>` URL as an unverified fabrication.
+    """
     issues: list[str] = []
 
     if not answer or not answer.strip():
@@ -108,6 +123,18 @@ def validate_answer(
     if _ascii_run_length(body) > 60:
         issues.append(
             "जवाफमा लामो अङ्ग्रेजी वाक्यांश छ — सम्पूर्ण नेपालीमा अनुवाद गर्नुहोस्।"
+        )
+
+    # (5) If the answer contains a `github.com/HimalayaAI/<repo>` URL but
+    #     no github tool was called this turn, the URL is almost certainly
+    #     fabricated (the bare org URL without a suffix is allowed and
+    #     does not match the regex). Ask for a rewrite using list_github_repos.
+    if not github_tool_was_used and _HIMALAYAAI_REPO_URL_RE.search(answer):
+        issues.append(
+            "GitHub repo URL उल्लेख गरिएको छ तर कुनै github tool call गरिएको छैन — "
+            "`list_github_repos` वा `analyze_github_repo` बिना `github.com/HimalayaAI/<repo>` "
+            "URL नराख्नुहोस्; fabricated हुन सक्छ। तथ्य चाहिए tool call गर्नुहोस्, नभए org page "
+            "`https://github.com/HimalayaAI` मात्र उद्धरण गर्नुहोस्।"
         )
 
     return issues
