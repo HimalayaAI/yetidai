@@ -42,6 +42,19 @@ _SOFT_RECENCY_TOKENS: tuple[str, ...] = (
 # when the user's query contains a recency keyword.
 RECENCY_THRESHOLD_DAYS = 3
 
+# Upstream NepalOSINT cache is populated by a scheduler that last ran
+# on this date. When `today - OSINT_COVERAGE_UNTIL > RECENCY_THRESHOLD_DAYS`,
+# the plugin forces a web fallback even for queries that didn't trigger
+# the recency-keyword gate — otherwise stale data leaks into answers as
+# if it were current (seen across P1, P3, P4 of the live test run).
+#
+# Set to None to disable the coverage-window check entirely (falls back
+# to per-payload date inference only).
+#
+# TODO: replace with a read from a NepalOSINT `/status` or `/as_of`
+# endpoint once one exists upstream.
+OSINT_COVERAGE_UNTIL: date | None = date(2026, 3, 31)
+
 # Keys whose values are likely to be dates. Checked first (cheaper than
 # scanning every string in every payload).
 _DATE_KEYS: frozenset[str] = frozenset({
@@ -133,26 +146,58 @@ def is_recency_query(query: str) -> bool:
     return any(tok in normalized for tok in _SOFT_RECENCY_TOKENS)
 
 
+# Sentinel so callers can explicitly disable the coverage check with
+# `coverage_until=None`, while an omitted kwarg defaults to the module
+# constant. Plain `None` would be indistinguishable from "unset".
+_COVERAGE_DEFAULT: Any = object()
+
+
 def assess_freshness(
     query: str,
     payloads: dict[str, Any],
     *,
     threshold_days: int = RECENCY_THRESHOLD_DAYS,
+    coverage_until: Any = _COVERAGE_DEFAULT,
 ) -> dict[str, Any]:
-    """Return `{stale: bool, newest: str|None, age_days: int|None, required: bool}`.
+    """Return `{stale, newest, age_days, required, coverage_gap, gap_days}`.
 
-    `required=True` when the query contains a recency keyword — callers
-    should treat a `stale=True` result as a signal to fall back to
-    internet_search, since OSINT is demonstrably behind.
+    `required=True` when the query contains a recency keyword — historically
+    used to gate the stale-fallback on recency keywords only. That gate is
+    now decoupled: `stale` fires whenever age > threshold regardless of
+    `required`. Callers should treat either `stale=True` or
+    `coverage_gap=True` as a signal to fall back to `internet_search`.
+
+    `coverage_gap=True` means the upstream OSINT cache itself hasn't been
+    refreshed past the `coverage_until` anchor — this catches cases where
+    individual payload dates look fresh but the whole dataset is frozen.
     """
     required = is_recency_query(query)
     newest = newest_date(payloads or {})
+    today = date.today()
+    anchor = OSINT_COVERAGE_UNTIL if coverage_until is _COVERAGE_DEFAULT else coverage_until
+    gap_days: int | None = None
+    coverage_gap = False
+    if anchor is not None:
+        gap_days = (today - anchor).days
+        coverage_gap = gap_days > threshold_days
     if newest is None:
-        return {"stale": False, "newest": None, "age_days": None, "required": required}
-    age = (date.today() - newest).days
+        return {
+            "stale": coverage_gap,
+            "newest": None,
+            "age_days": None,
+            "required": required,
+            "coverage_gap": coverage_gap,
+            "gap_days": gap_days,
+        }
+    age = (today - newest).days
     return {
-        "stale": required and age > threshold_days,
+        # Decoupled from `required` — stale whenever data is older than
+        # threshold. Lets non-recency Nepal queries (macro, who_is, trading)
+        # also fall back to web when OSINT is behind.
+        "stale": age > threshold_days or coverage_gap,
         "newest": newest.isoformat(),
         "age_days": age,
         "required": required,
+        "coverage_gap": coverage_gap,
+        "gap_days": gap_days,
     }

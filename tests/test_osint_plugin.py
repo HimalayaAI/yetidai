@@ -77,10 +77,14 @@ class OsintPluginHandlerTests(unittest.TestCase):
 
         mock_brief = "Macro snapshot\n- Inflation: 5.20%"
 
+        # Disable the global OSINT coverage-gap anchor so this test
+        # exercises only the "fresh payload, no stale marker" path.
+        # The coverage-gap behavior has its own tests.
         with (
             patch("tools.osint.plugin.resolve_route_plan", mock_plan),
             patch("tools.osint.plugin.fetch_context_bundle", mock_bundle),
             patch("tools.osint.plugin.build_context_brief", return_value=mock_brief),
+            patch("tools.osint.freshness.OSINT_COVERAGE_UNTIL", None),
         ):
             result = asyncio.run(handle_osint(ctx, {"focus": "inflation"}))
 
@@ -135,6 +139,7 @@ class OsintPluginHandlerTests(unittest.TestCase):
             patch("tools.osint.plugin.resolve_route_plan", mock_plan),
             patch("tools.osint.plugin.fetch_context_bundle", mock_bundle),
             patch("tools.osint.plugin.build_context_brief", return_value="Debt: NPR 2.5T"),
+            patch("tools.osint.freshness.OSINT_COVERAGE_UNTIL", None),
         ):
             result = asyncio.run(
                 registry.execute("get_nepal_live_context", ctx, {"focus": "debt"})
