@@ -54,6 +54,21 @@ class EmptyPromiseTests(unittest.TestCase):
         self.assertFalse(is_empty_promise(""))
         self.assertFalse(is_empty_promise(None))
 
+    def test_lyaaunchhu(self) -> None:
+        # The exact text from the "will it ping me" transcript.
+        self.assertTrue(is_empty_promise(
+            "लौ, नेपालOSINT बाट अघिल्लो २४ घण्टाको ताजा समाचारहरू ल्याउँछु।"
+        ))
+
+    def test_khojnechhu(self) -> None:
+        self.assertTrue(is_empty_promise("म यसको बारेमा खोज्नेछु।"))
+
+    def test_ill_bring(self) -> None:
+        self.assertTrue(is_empty_promise("I'll bring you the latest."))
+
+    def test_let_me_find(self) -> None:
+        self.assertTrue(is_empty_promise("Let me find that."))
+
 
 class NeedsToolUseTests(unittest.TestCase):
     def test_urls_need_tool(self) -> None:

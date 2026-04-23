@@ -411,15 +411,21 @@ _EMPTY_PROMISE_PATTERNS: tuple["re.Pattern[str]", ...] = (
     re.compile(r"म .{0,40}दिन्छु"),                  # "म जानकारी दिन्छु"
     re.compile(r"म .{0,40}प्रदान गर्छु"),             # "म समाचार प्रदान गर्छु"
     re.compile(r"म .{0,40}पठाउँछु"),                # "म पठाउँछु"
+    # "ल्याउँछु / ल्याउनेछु" — "I will bring/fetch". This is the
+    # specific verb Yeti reached for when saying "NepalOSINT बाट ताजा
+    # समाचार ल्याउँछु" without ever calling the tool.
+    re.compile(r"म .{0,60}ल्याउँछु"),
+    re.compile(r"म .{0,60}ल्याउनेछु"),
+    re.compile(r".{0,40}ल्याउँछु।?$"),
     # Future-tense "will do / will help / will look" — the GitHub-commit
     # trace landed on "help गर्नेछु" which the earlier pattern set missed.
-    re.compile(r"म .{0,60}(?:गर्नेछु|गर्छु|हेर्नेछु|हेर्छु)"),
+    re.compile(r"म .{0,60}(?:गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|खोज्नेछु|खोज्छु)"),
     re.compile(r"तपाईं(?:ँ|ले|लाई).{0,60}(?:बताउँछु|सुनाउँछु|दिन्छु|पठाउँछु|"
-               r"गर्नेछु|गर्छु|हेर्नेछु|हेर्छु)"),
+               r"गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|ल्याउँछु|ल्याउनेछु)"),
     re.compile(r"help गर्(?:छु|नेछु)", re.IGNORECASE),
-    re.compile(r"let me (fetch|search|check|look|see|analyze)", re.IGNORECASE),
+    re.compile(r"let me (fetch|search|check|look|see|analyze|bring|find)", re.IGNORECASE),
     re.compile(
-        r"i ?(will|'ll|'d) (fetch|search|check|look|provide|get|tell|help|analyze|see)",
+        r"i ?(will|'ll|'d) (fetch|search|check|look|provide|get|tell|help|analyze|see|bring|find)",
         re.IGNORECASE,
     ),
 )
