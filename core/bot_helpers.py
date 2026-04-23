@@ -438,8 +438,16 @@ _EMPTY_PROMISE_PATTERNS: tuple["re.Pattern[str]", ...] = (
     # Future-tense "will do / will help / will look" — the GitHub-commit
     # trace landed on "help गर्नेछु" which the earlier pattern set missed.
     re.compile(r"म .{0,60}(?:गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|खोज्नेछु|खोज्छु)"),
+    # Present-continuous "am ...ing" forms. Observed: "म नेपालको
+    # वर्तमान प्रधानमन्त्री खोज्दैछु।" — same empty-promise shape as
+    # "खोज्छु" (future) but in present-continuous (-दैछु ending).
+    # Without these the safety net misses a whole class of placeholder
+    # replies and ships them to Discord raw.
+    re.compile(r"म .{0,60}(?:गर्दैछु|हेर्दैछु|खोज्दैछु|ल्याउँदैछु|"
+               r"पठाउँदैछु|बताउँदैछु|सुनाउँदैछु|दिँदैछु)"),
     re.compile(r"तपाईं(?:ँ|ले|लाई).{0,60}(?:बताउँछु|सुनाउँछु|दिन्छु|पठाउँछु|"
-               r"गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|ल्याउँछु|ल्याउनेछु)"),
+               r"गर्नेछु|गर्छु|हेर्नेछु|हेर्छु|ल्याउँछु|ल्याउनेछु|"
+               r"गर्दैछु|हेर्दैछु|खोज्दैछु)"),
     re.compile(r"help गर्(?:छु|नेछु)", re.IGNORECASE),
     re.compile(r"let me (fetch|search|check|look|see|analyze|bring|find)", re.IGNORECASE),
     re.compile(
@@ -613,6 +621,11 @@ def _suggest_tool_for(user_text: str) -> str:
     # Parliament
     if re.search(r"(parliament|संसद|विधेयक|बिल)", t):
         return ('get_nepal_live_context(intent="parliament")')
+    # Resign / cabinet shake-ups → news lookup. Observed:
+    # "SUDAN GURUNG le kina resign gareyko" had no specific intent
+    # match and got no hint, leading to another empty promise.
+    if re.search(r"(resign|कार्यभार छोड|राजीनामा|बर्खास्त|nikalek|nikalyaeko)", t):
+        return ('get_nepal_live_context(intent="general_news")')
     # GitHub
     if re.search(r"github\.com|\brepo\b|\brepos\b", t):
         return ("analyze_github_repo वा list_github_repos")
