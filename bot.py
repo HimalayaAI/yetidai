@@ -681,12 +681,21 @@ async def on_message(message):
                     "role": "system",
                     "content": build_force_tool_nudge(chad.user_input),
                 })
+                # First attempt: tool_choice="required" — strongest hint
+                # we can give Sarvam that it MUST emit a tool_call this
+                # round. Some SDK versions reject "required"; fall back
+                # to "auto" on any error from the SDK side.
                 try:
                     force_resp = await _run_llm_turn(
-                        messages, tools_array=tools_array, tool_choice="auto",
+                        messages, tools_array=tools_array, tool_choice="required",
                     )
                 except Exception:
-                    force_resp = None
+                    try:
+                        force_resp = await _run_llm_turn(
+                            messages, tools_array=tools_array, tool_choice="auto",
+                        )
+                    except Exception:
+                        force_resp = None
                 if force_resp and getattr(force_resp, "choices", None):
                     force_choice = force_resp.choices[0]
                     force_calls = getattr(force_choice.message, "tool_calls", None) or []
@@ -753,6 +762,22 @@ async def on_message(message):
                         retry_text = force_choice.message.content or ""
                         if retry_text and not is_empty_promise(retry_text):
                             ai_response = retry_text
+
+                # Final safety net: if the first pass AND the forced
+                # retry both produced empty-promise text, replace the
+                # user-visible answer with an honest apology so the
+                # bot never ships a bare "म खोज्छु" that goes nowhere.
+                if is_empty_promise(ai_response, tool_was_used=tool_was_used):
+                    ai_response = (
+                        "माफ गर्नुहोस् हजुर — अहिले यो प्रश्नको लागि "
+                        "live data ल्याउन सकिएन। केही सेकेन्डपछि पुनः "
+                        "सोध्नुहोस्, वा अलि विस्तृत प्रश्न दिनुहोस्।"
+                    )
+                    logger.info(
+                        "Empty promise persisted through forced retry "
+                        "(turn=%s) — replacing with honest apology.",
+                        turn_id,
+                    )
         except Exception as exc:
             logger.exception("Sarvam call / tool loop failed")
             llm_exc = exc
