@@ -42,38 +42,6 @@ _SOFT_RECENCY_TOKENS: tuple[str, ...] = (
 # when the user's query contains a recency keyword.
 RECENCY_THRESHOLD_DAYS = 3
 
-
-def _read_coverage_env() -> date | None:
-    """Parse `OSINT_COVERAGE_UNTIL=YYYY-MM-DD` from env.
-
-    Returns None when the env var is unset, empty, or unparseable —
-    every caller therefore defaults to "no coverage anchor" behavior.
-    This is the opt-in: to activate the coverage-gap path, set the env
-    var in production. Without it, the module behaves exactly as it did
-    before the gap feature was introduced.
-    """
-    import os as _os
-    raw = (_os.getenv("OSINT_COVERAGE_UNTIL") or "").strip()
-    if not raw:
-        return None
-    try:
-        y, m, d = raw.split("-")
-        return date(int(y), int(m), int(d))
-    except (ValueError, TypeError):
-        return None
-
-
-# Upstream NepalOSINT cache is populated by a scheduler; when the whole
-# dataset is frozen past a date, per-payload freshness heuristics miss
-# it (individual items look "recent" relative to themselves). Setting
-# OSINT_COVERAGE_UNTIL in the environment tells freshness checks the
-# true upper bound of coverage — any delta beyond RECENCY_THRESHOLD_DAYS
-# surfaces as `coverage_gap=True`, forcing a web fallback.
-#
-# Default None = opt-in. Railway deploys without the env var behave
-# exactly as before this feature existed.
-OSINT_COVERAGE_UNTIL: date | None = _read_coverage_env()
-
 # Keys whose values are likely to be dates. Checked first (cheaper than
 # scanning every string in every payload).
 _DATE_KEYS: frozenset[str] = frozenset({
@@ -165,73 +133,26 @@ def is_recency_query(query: str) -> bool:
     return any(tok in normalized for tok in _SOFT_RECENCY_TOKENS)
 
 
-# Sentinel so callers can explicitly disable the coverage check with
-# `coverage_until=None`, while an omitted kwarg defaults to the module
-# constant (which itself defaults to None — opt-in via env).
-_COVERAGE_DEFAULT: Any = object()
-
-
 def assess_freshness(
     query: str,
     payloads: dict[str, Any],
     *,
     threshold_days: int = RECENCY_THRESHOLD_DAYS,
-    coverage_until: Any = _COVERAGE_DEFAULT,
 ) -> dict[str, Any]:
-    """Return `{stale, newest, age_days, required, coverage_gap, gap_days}`.
+    """Return `{stale: bool, newest: str|None, age_days: int|None, required: bool}`.
 
-    `required=True` when the query contains a recency keyword — retained
-    for downstream callers that distinguish "asked for today" vs "asked
-    anything". Staleness is ALSO decoupled: when coverage_until is set
-    (via OSINT_COVERAGE_UNTIL env var) and today exceeds it by more than
-    `threshold_days`, `stale=True` regardless of `required` — the whole
-    OSINT dataset is behind, and even non-recency queries shouldn't cite
-    it as current.
-
-    When neither the env anchor nor an explicit `coverage_until` is
-    provided, behavior matches the pre-feature contract: stale only
-    fires on recency-tagged queries with aged-out payloads.
+    `required=True` when the query contains a recency keyword — callers
+    should treat a `stale=True` result as a signal to fall back to
+    internet_search, since OSINT is demonstrably behind.
     """
     required = is_recency_query(query)
     newest = newest_date(payloads or {})
-    today = date.today()
-
-    anchor: date | None
-    if coverage_until is _COVERAGE_DEFAULT:
-        anchor = OSINT_COVERAGE_UNTIL
-    else:
-        anchor = coverage_until
-
-    gap_days: int | None = None
-    coverage_gap = False
-    if anchor is not None:
-        gap_days = (today - anchor).days
-        coverage_gap = gap_days > threshold_days
-
     if newest is None:
-        return {
-            "stale": coverage_gap,
-            "newest": None,
-            "age_days": None,
-            "required": required,
-            "coverage_gap": coverage_gap,
-            "gap_days": gap_days,
-        }
-    age = (today - newest).days
-    # When no coverage anchor is configured (default, legacy-compatible),
-    # keep the pre-feature contract: stale only on recency queries. When
-    # an anchor IS configured, fire stale on any aged-out payload so web
-    # fallback triggers for every Nepal intent — that's the opt-in
-    # behavior change.
-    if anchor is not None:
-        payload_stale = age > threshold_days
-    else:
-        payload_stale = required and age > threshold_days
+        return {"stale": False, "newest": None, "age_days": None, "required": required}
+    age = (date.today() - newest).days
     return {
-        "stale": payload_stale or coverage_gap,
+        "stale": required and age > threshold_days,
         "newest": newest.isoformat(),
         "age_days": age,
         "required": required,
-        "coverage_gap": coverage_gap,
-        "gap_days": gap_days,
     }

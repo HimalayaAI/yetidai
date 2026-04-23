@@ -37,14 +37,6 @@ from tools.osint.freshness import assess_freshness
 # behind a stale citation.
 STALE_DATA_MARKER = "[STALE_DATA]"
 
-# Emitted when the upstream NepalOSINT cache as a whole is frozen past
-# its coverage anchor (set via OSINT_COVERAGE_UNTIL env var). Fires in
-# addition to / instead of STALE_DATA depending on which condition the
-# freshness check flags. Only active when the env var is set —
-# defaults to dormant so Railway deploys see zero behavior change
-# until the anchor is explicitly configured.
-COVERAGE_GAP_MARKER = "[OSINT_COVERAGE_GAP]"
-
 
 import re as _re
 
@@ -253,24 +245,13 @@ async def handle_osint(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResul
         if freshness.get("stale"):
             age = freshness.get("age_days")
             newest = freshness.get("newest")
-            coverage_gap = bool(freshness.get("coverage_gap"))
-            gap_days = freshness.get("gap_days")
-            if coverage_gap:
-                stale_header = (
-                    f"{COVERAGE_GAP_MARKER} NepalOSINT's upstream cache is "
-                    f"{gap_days} days behind its coverage anchor. DO NOT "
-                    f"cite any number or date from this payload as current. "
-                    f"Acknowledge the gap to the user in Nepali and use the "
-                    f"internet_search fallback as primary.\n\n"
-                )
-            else:
-                stale_header = (
-                    f"{STALE_DATA_MARKER} NepalOSINT's freshest story is "
-                    f"{age} days old ({newest}), but the user asked about a "
-                    f"current event. DO NOT present this as today's news — "
-                    f"say the data is stale and rely on the web-search "
-                    f"fallback that runs next.\n\n"
-                )
+            stale_header = (
+                f"{STALE_DATA_MARKER} NepalOSINT's freshest story is "
+                f"{age} days old ({newest}), but the user asked about a "
+                f"current event. DO NOT present this as today's news — "
+                f"say the data is stale and rely on the web-search "
+                f"fallback that runs next.\n\n"
+            )
             # Return a stale-flagged result and chain to internet_search.
             # The loop will surface the web result and the model can
             # decide which to cite.
