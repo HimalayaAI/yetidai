@@ -33,7 +33,7 @@ GENERIC_TECH_ERROR = (
 BOT_APOLOGY_PREFIXES: tuple[str, ...] = (
     "माफ गर्नुहोस्, एउटा प्राविधिक समस्या",
     "माफ गर्नुहोस्, उत्तर तयार गर्न सकिएन",
-    "माफ गर्नुहोस्, Sarvam",
+    "माफ गर्नुहोस्, HimalayaGPT",
     "माफ गर्नुहोस्, नेटवर्क",
 )
 
@@ -46,7 +46,7 @@ _ASCII_TO_DEVANAGARI = str.maketrans("0123456789", "०१२३४५६७८�
 def is_bot_apology(content: str) -> bool:
     """True if a message looks like one of our own generic failure strings.
 
-    Filtered out of replayed history so Sarvam never learns to parrot it.
+    Filtered out of replayed history so HimalayaGPT never learns to parrot it.
     """
     if not content:
         return False
@@ -142,17 +142,17 @@ def classify_llm_error(exc: BaseException | None) -> str:
         return f"{GENERIC_TECH_ERROR}\n[debug] no-exception; empty answer"
     if isinstance(exc, asyncio.TimeoutError):
         return (
-            "माफ गर्नुहोस्, Sarvam जवाफ दिन ढिला भयो। एकछिन पछि पुनः प्रयास गर्नुहोस्।"
+            "माफ गर्नुहोस्, HimalayaGPT जवाफ दिन ढिला भयो। एकछिन पछि पुनः प्रयास गर्नुहोस्।"
         )
     status = _error_status_code(exc)
     name = type(exc).__name__.lower()
     if status == 429 or "ratelimit" in name:
         return (
-            "माफ गर्नुहोस्, Sarvam अहिले व्यस्त छ। केही सेकेन्डपछि पुनः प्रयास गर्नुहोस्।"
+            "माफ गर्नुहोस्, HimalayaGPT अहिले व्यस्त छ। केही सेकेन्डपछि पुनः प्रयास गर्नुहोस्।"
         )
     if isinstance(status, int) and 500 <= status < 600:
         return (
-            "माफ गर्नुहोस्, Sarvam सेवामा समस्या छ। एकछिन पछि पुनः प्रयास गर्नुहोस्।"
+            "माफ गर्नुहोस्, HimalayaGPT सेवामा समस्या छ। एकछिन पछि पुनः प्रयास गर्नुहोस्।"
         )
     if "connect" in name or "network" in name:
         return "माफ गर्नुहोस्, नेटवर्क समस्या देखियो। पुनः प्रयास गर्नुहोस्।"

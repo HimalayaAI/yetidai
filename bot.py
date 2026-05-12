@@ -32,7 +32,7 @@ Tool-loop design (mirrors Anthropic's "let the model decide" model):
 
 Resilience:
   - Per-phase try/except so one failure can't masquerade as another.
-  - Sarvam calls wrapped in asyncio.wait_for with one transient retry.
+  - HimalayaGPT calls wrapped in asyncio.wait_for with one transient retry.
   - Last tool-round forces tools=None so the LLM must emit text.
   - Deterministic fixups (ASCII→Devanagari digits, स्रोत line injection)
     run before invoking a second LLM turn for validator nudges.
@@ -355,6 +355,7 @@ async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
                     messages=messages,
                     tools=tools_array if tools_array else None,
                     tool_choice=tool_choice if tools_array else None,
+                    temperature=0.2,
                 ),
                 timeout=TIME_OUT_SECONDS,
             )
@@ -467,7 +468,7 @@ async def on_message(message):
 
             # Correction / count-intent nudges. These are cheap signals that
             # materially change the model's next turn — we inject them as
-            # a system message RIGHT BEFORE the current user turn so Sarvam
+            # a system message RIGHT BEFORE the current user turn so HimalayaGPT
             # reads them fresh without paying attention-decay on a long
             # history.
             if looks_like_correction(chad.user_input):
@@ -492,7 +493,7 @@ async def on_message(message):
             # Deterministic rule-based classifier decides if the query
             # needs a specific tool. If yes, we execute it NOW and feed
             # the result into messages as a synthetic prior tool call.
-            # Sarvam's first turn then has the data in context and only
+            # HimalayaGPT's first turn then has the data in context and only
             # needs to write the Nepali summary — it literally cannot
             # emit "म खोज्छु" any more, because the work is done.
             preflight = plan_preflight(chad.user_input)
@@ -520,7 +521,7 @@ async def on_message(message):
 
                 if pf_result is not None:
                     # Append the synthetic tool_call + tool result as if
-                    # Sarvam had already chosen this tool. Sarvam's next
+                    # HimalayaGPT had already chosen this tool. HimalayaGPT's next
                     # turn sees a completed interaction and continues.
                     messages.append({
                         "role": "assistant",
@@ -558,7 +559,7 @@ async def on_message(message):
 
                     # If the preflight triggered a fallback (e.g. OSINT
                     # returned empty → internet_search), execute the
-                    # fallback too so Sarvam has that data as well.
+                    # fallback too so HimalayaGPT has that data as well.
                     if pf_result.trigger_fallback and pf_result.fallback_tool:
                         fb_tc_id = f"preflight_fb_{uuid.uuid4().hex[:8]}"
                         fb_args = pf_result.fallback_args or {}
@@ -620,7 +621,7 @@ async def on_message(message):
             return
 
         # ── Tool-call loop ────────────────────────────────────────
-        # On the final round we strip tools to force Sarvam to emit text,
+        # On the final round we strip tools to force HimalayaGPT to emit text,
         # eliminating the "ran out of rounds with empty ai_response" failure
         # mode. If the model emits the same tool_calls signature two rounds
         # in a row we also break early — no point burning more budget on a
@@ -634,7 +635,7 @@ async def on_message(message):
                 is_last_round = (_round == MAX_TOOL_ROUNDS - 1)
 
                 # On the forced-text round, tell the model explicitly that
-                # no more tools are available. Without this nudge Sarvam
+                # no more tools are available. Without this nudge HimalayaGPT
                 # sometimes narrates "I would call X but..." in the final
                 # text. Injected once, just before the last LLM turn.
                 if is_last_round and not final_nudge_injected and tools_array:
@@ -868,7 +869,7 @@ async def on_message(message):
                     "content": build_force_tool_nudge(chad.user_input),
                 })
                 # First attempt: tool_choice="required" — strongest hint
-                # we can give Sarvam that it MUST emit a tool_call this
+                # we can give HimalayaGPT that it MUST emit a tool_call this
                 # round. Some SDK versions reject "required"; fall back
                 # to "auto" on any error from the SDK side.
                 try:
@@ -934,7 +935,7 @@ async def on_message(message):
                                 "forced": True,
                                 **log_extra,
                             })
-                        # Ask Sarvam to compose the real answer now (no more tools).
+                        # Ask HimalayaGPT to compose the real answer now (no more tools).
                         final_resp = await _run_llm_turn(
                             messages, tools_array=None, tool_choice=None,
                         )
@@ -965,7 +966,7 @@ async def on_message(message):
                         turn_id,
                     )
         except Exception as exc:
-            logger.exception("Sarvam call / tool loop failed")
+            logger.exception("HimalayaGPT call / tool loop failed")
             llm_exc = exc
 
         # ── Anti-hallucination: fabricated filenames ─────────────
@@ -1078,7 +1079,7 @@ async def on_message(message):
 
                 # Re-validate *after* fixups: if the only problems were
                 # ASCII digits and a missing स्रोत line, we've just solved
-                # them without burning a Sarvam call.
+                # them without burning a HimalayaGPT call.
                 post_issues = validate_answer(
                     ai_response,
                     tool_was_used=tool_was_used,
