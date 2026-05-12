@@ -21,14 +21,14 @@ from google.oauth2.service_account import Credentials
 
 ENV_PATH = Path(".env")
 STATE_PATH = Path("introsync_state.json")
-SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions"
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 MAX_CHUNK_CHARS = 5000
 MAX_MESSAGES_PER_CHUNK = 8
 
 REQUIRED_ENV_VARS = [
     "DISCORD_TOKEN",
-    "SARVAM_API_KEY",
-    "SARVAM_ROUTER_MODEL",
+    "API_KEY",
+    "MODEL_NAME",
     "INTRO_CHANNEL_ID",
     "GUILD_ID",
     "GOOGLE_SHEET_ID",
@@ -119,14 +119,14 @@ SUMMARY_MERGE_SYSTEM_PROMPT = (
 @dataclass
 class IntroSyncConfig:
     discord_token: str
-    sarvam_api_key: str
-    sarvam_model: str
+    api_key: str
+    model_name: str
     intro_channel_id: int
     guild_id: int
     google_sheet_id: str
 
 
-class SarvamChunkError(Exception):
+class OpenAIChunkError(Exception):
     def __init__(self, message: str, raw_response: str | None = None) -> None:
         super().__init__(message)
         self.raw_response = raw_response
@@ -165,8 +165,8 @@ def load_config() -> IntroSyncConfig:
 
     return IntroSyncConfig(
         discord_token=os.getenv("DISCORD_TOKEN", ""),
-        sarvam_api_key=os.getenv("SARVAM_API_KEY", ""),
-        sarvam_model=os.getenv("SARVAM_ROUTER_MODEL", ""),
+        api_key=os.getenv("API_KEY", "") or os.getenv("OPENAI_API_KEY", ""),
+        model_name=os.getenv("MODEL_NAME", "") or os.getenv("OPENAI_MODEL_NAME", "") or os.getenv("OPENAI_MODEL", ""),
         intro_channel_id=intro_channel_id,
         guild_id=guild_id,
         google_sheet_id=os.getenv("GOOGLE_SHEET_ID", ""),
@@ -406,23 +406,22 @@ async def request_merged_summary(
     )
 
     payload = {
-        "model": config.sarvam_model,
+        "model": config.model_name,
         "messages": [
             {"role": "system", "content": SUMMARY_MERGE_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
         "max_tokens": 512,
-        "budget_tokens": 256,
     }
     headers = {
         "Content-Type": "application/json",
-        "api-subscription-key": config.sarvam_api_key,
+        "Authorization": f"Bearer {config.api_key}",
     }
 
     async def send_summary_merge_request(request_payload: dict[str, Any]) -> str:
         timeout = aiohttp.ClientTimeout(total=90)
         async with session.post(
-            SARVAM_URL,
+            OPENAI_URL,
             json=request_payload,
             headers=headers,
             timeout=timeout,
@@ -442,7 +441,7 @@ async def request_merged_summary(
 
         # Retry once with a tighter response contract.
         retry_payload = {
-            "model": config.sarvam_model,
+            "model": config.model_name,
             "messages": [
                 {"role": "system", "content": SUMMARY_MERGE_SYSTEM_PROMPT},
                 {
@@ -455,7 +454,6 @@ async def request_merged_summary(
                 },
             ],
             "max_tokens": 300,
-            "budget_tokens": 128,
         }
         retry_content = await send_summary_merge_request(retry_payload)
         retry_merged = extract_merged_summary_from_text(retry_content)
@@ -642,7 +640,7 @@ def sanitize_model_output(content: str) -> str:
     )
 
 
-async def call_sarvam_for_chunk(
+async def call_openai_for_chunk(
     session: aiohttp.ClientSession,
     config: IntroSyncConfig,
     chunk_content: str,
@@ -650,7 +648,7 @@ async def call_sarvam_for_chunk(
     user_prompt = USER_PROMPT_TEMPLATE.replace("__CHUNK_CONTENT__", chunk_content)
 
     payload = {
-        "model": config.sarvam_model,
+        "model": config.model_name,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
@@ -659,27 +657,26 @@ async def call_sarvam_for_chunk(
             },
         ],
         "max_tokens": 4096,
-        "budget_tokens": 2048,
     }
     headers = {
         "Content-Type": "application/json",
-        "api-subscription-key": config.sarvam_api_key,
+        "Authorization": f"Bearer {config.api_key}",
     }
 
     timeout = aiohttp.ClientTimeout(total=120)
     async with session.post(
-        SARVAM_URL,
+        OPENAI_URL,
         json=payload,
         headers=headers,
         timeout=timeout,
     ) as response:
         raw_text = await response.text()
         if response.status >= 400:
-            raise SarvamChunkError(f"HTTP {response.status}", raw_response=raw_text)
+            raise OpenAIChunkError(f"HTTP {response.status}", raw_response=raw_text)
         try:
             response_json = json.loads(raw_text)
         except Exception as exc:
-            raise SarvamChunkError(
+            raise OpenAIChunkError(
                 f"Invalid API JSON: {exc}",
                 raw_response=raw_text,
             ) from exc
@@ -789,14 +786,14 @@ async def classify_messages(
             chunk_messages = list(id_map.values())
             chunk_last_message = chunk_messages[-1] if chunk_messages else None
             try:
-                model_content, raw_api_response, finish_reason = await call_sarvam_for_chunk(
+                model_content, raw_api_response, finish_reason = await call_openai_for_chunk(
                     session=session,
                     config=config,
                     chunk_content=chunk_content,
                 )
             except Exception as exc:
                 raw_hint = ""
-                if isinstance(exc, SarvamChunkError) and exc.raw_response:
+                if isinstance(exc, OpenAIChunkError) and exc.raw_response:
                     raw_hint = f" | Raw: {exc.raw_response[:300]}"
                 log(
                     f"[API ERROR] Chunk {chunk_index}/{len(chunks)} failed — "

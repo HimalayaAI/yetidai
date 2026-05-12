@@ -5,7 +5,7 @@ dynamic system prompt.
 Why a dedicated module:
   * bot.py was building the block inline; adding today + hijo + "last
     week" made the code messy.
-  * We want this logic unit-tested without spinning up discord / sarvam.
+  * We want this logic unit-tested without spinning up discord / the LLM backend.
   * The block has to be prominent (Sarvam-30B has attention decay on
     very long prompts), consistent, and honest about when BS isn't
     available.

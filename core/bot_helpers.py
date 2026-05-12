@@ -1,7 +1,7 @@
 """
 core/bot_helpers.py — side-effect-free helpers used by bot.py.
 
-Kept deliberately free of the `discord` and `sarvamai` imports so tests can
+Kept deliberately free of the `discord` and OpenAI client imports so tests can
 exercise them directly without stubbing the whole Discord/SDK surface.
 
 Groups:
@@ -198,7 +198,7 @@ def normalize_digits(text: str) -> str:
 # the LLM so it can decide between "retry with different args", "switch to
 # a fallback tool", or "apologize in Nepali with a partial answer". This
 # mirrors Anthropic's `is_error` convention — we just encode it inline
-# because the OpenAI/Sarvam tool message shape has no dedicated flag.
+# because the OpenAI tool message shape has no dedicated flag.
 
 TOOL_ERROR_MARKER = "[TOOL_ERROR]"
 TOOL_TIMEOUT_MARKER = "[TOOL_TIMEOUT]"

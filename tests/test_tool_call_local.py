@@ -1,11 +1,11 @@
 """
 Local integration test — simulates the bot.py tool-calling flow
-without Discord, using the real Sarvam API + real NepalOSINT.
+without Discord, using the real OpenAI-compatible API + real NepalOSINT.
 
 Usage:
     python tests/test_tool_call_local.py
 
-Requires SARVAM_API_KEY in .env.
+Requires API_KEY in .env.
 """
 import asyncio
 import json
@@ -13,7 +13,7 @@ import os
 import sys
 
 from dotenv import load_dotenv
-from sarvamai import AsyncSarvamAI
+from openai import AsyncOpenAI
 
 # Ensure project root is on the path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,12 +27,20 @@ import tools.search.plugin as search_plugin
 
 load_dotenv()
 
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
-if not SARVAM_API_KEY:
-    print("❌ SARVAM_API_KEY not found in .env — cannot run local test.")
+API_KEY = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
+BASE_URL = os.getenv("BASE_URL") or os.getenv("OPENAI_BASE_URL")
+MODEL_NAME = (
+    os.getenv("MODEL_NAME")
+    or os.getenv("OPENAI_MODEL_NAME")
+    or os.getenv("OPENAI_MODEL")
+    or "gpt-4.1-mini"
+)
+
+if not API_KEY:
+    print("❌ API_KEY not found in .env — cannot run local test.")
     sys.exit(1)
 
-llm_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
+llm_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL or None)
 
 with open("systemPrompt.txt", "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
@@ -61,7 +69,7 @@ async def simulate_bot_flow(user_query: str) -> None:
     # 2. Get tools array from registry
     tools_array = registry.openai_tools()
     print(f"\n🔧 Registered tools: {[t['function']['name'] for t in tools_array]}")
-    print(f"   Tool schema sent to Sarvam:")
+    print(f"   Tool schema sent to OpenAI-compatible model:")
     for t in tools_array:
         print(f"   - {t['function']['name']}: {t['function']['description'][:80]}...")
 
@@ -69,10 +77,10 @@ async def simulate_bot_flow(user_query: str) -> None:
     response = None
     for round_num in range(MAX_TOOL_ROUNDS):
         print(f"\n{'─' * 50}")
-        print(f"🔄 Round {round_num + 1}: Calling Sarvam (tool_choice='auto')...")
+        print(f"🔄 Round {round_num + 1}: Calling OpenAI-compatible model (tool_choice='auto')...")
 
-        response = await llm_client.chat.completions(
-            model="sarvam-30b",
+        response = await llm_client.chat.completions.create(
+            model=MODEL_NAME,
             messages=messages,
             tools=tools_array if tools_array else None,
             tool_choice="auto" if tools_array else None,

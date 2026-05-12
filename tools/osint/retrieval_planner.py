@@ -195,7 +195,7 @@ async def resolve_route_plan(
          This is the fast path: 0 extra LLM calls.
       2. `route_query` keyword rules — deterministic, local, 0 LLM calls.
          Used when the intent is unambiguous from keywords alone.
-      3. LLM planner (Sarvam) — only for ambiguous short queries or
+      3. LLM planner — only for ambiguous short queries or
          multi-domain queries. One extra completion call, ~1.5 s budget,
          with fall-through to the keyword base plan on any failure.
 
@@ -265,10 +265,15 @@ async def resolve_route_plan(
     planner_messages.append({"role": "user", "content": f"Current user query:\n{query}"})
 
     try:
-        timeout_seconds = float(os.getenv("SARVAM_ROUTER_TIMEOUT_SECONDS", "1.5"))
+        timeout_seconds = float(os.getenv("OPENAI_ROUTER_TIMEOUT_SECONDS") or os.getenv("ROUTER_TIMEOUT_SECONDS") or "1.5")
         response = await asyncio.wait_for(
-            llm_client.chat.completions(
-                model=os.getenv("SARVAM_ROUTER_MODEL", "sarvam-30b"),
+            llm_client.chat.completions.create(
+                model=(
+                    os.getenv("OPENAI_ROUTER_MODEL")
+                    or os.getenv("ROUTER_MODEL")
+                    or os.getenv("MODEL_NAME")
+                    or "gpt-4.1-mini"
+                ),
                 messages=planner_messages,
             ),
             timeout=timeout_seconds,

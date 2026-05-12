@@ -26,17 +26,29 @@ class functional:
             return
 
         self.user_input= None
-        
-        if message.content.startswith('!chat'):
-            self.user_input = message.content[len('!chat'):].strip()
 
+        content = (message.content or "").strip()
+        if not content:
+            return
+
+        if content.startswith('!chat'):
+            self.user_input = content[len('!chat'):].strip()
         elif self.bot.user.mentioned_in(message):
-            self.user_input = message.content
+            self.user_input = content
             for mention in message.mentions:
                 if mention == self.bot.user:
-                    self.user_input = re.sub(rf'<@!?{self.bot.user.id}>', '', self.user_input).strip()  #bot lai ping ra mention gareko msg filter garxa
-        
+                    self.user_input = re.sub(
+                        rf'<@!?{self.bot.user.id}>',
+                        '',
+                        self.user_input,
+                    ).strip()  # bot lai ping ra mention gareko msg filter garxa
+        else:
+            # Default behavior: respond to ordinary human messages too,
+            # not just explicit mentions. This lets English messages work
+            # the same way as Nepali ones.
+            self.user_input = content
+
         if not self.user_input:
-            if message.content.startswith('!chat'):
+            if content.startswith('!chat'):
                 await message.channel.send("कृपया आफ्नो प्रश्न लेख्नुहोस्। उदाहरण: `!chat नमस्ते`")
             return

@@ -3,9 +3,9 @@ tools/osint/plugin.py — Nepal OSINT plugin for YetiDai.
 
 This is the ONLY module that bot.py imports from the OSINT package.
 It registers itself with the global ToolRegistry so the LLM can
-invoke it via Sarvam's native tool_choice mechanism.
+invoke it via the OpenAI-compatible tool_choice mechanism.
 
-Sarvam tool-call contract (see tests/test_sarvam_tool_calling_live.py):
+OpenAI tool-call contract (see tests/test_openai_tool_calling_live.py):
     1. bot sends  tools=[{type: "function", function: {name, description, parameters}}]
     2. LLM returns finish_reason="tool_calls" with tool_calls[].function.{name, arguments}
     3. bot executes handler, sends back {role: "tool", tool_call_id, content}

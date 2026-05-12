@@ -1,1 +1,10 @@
 .env
+.agents/
+.codex
+__pycache__
+env
+venv
+*.pyc
+*.pyo
+*.pyd       
+venv/

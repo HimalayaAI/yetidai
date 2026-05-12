@@ -3,21 +3,30 @@ import os
 import unittest
 
 from dotenv import load_dotenv
-from sarvamai import AsyncSarvamAI
+from openai import AsyncOpenAI
 
 
 def _live_tests_enabled() -> bool:
-    return os.getenv("RUN_LIVE_SARVAM_TESTS", "0") == "1"
+    return os.getenv("RUN_LIVE_OPENAI_TESTS", "0") == "1"
 
 
-@unittest.skipUnless(_live_tests_enabled(), "Set RUN_LIVE_SARVAM_TESTS=1 to run live Sarvam tests.")
-class SarvamToolCallingLiveTests(unittest.IsolatedAsyncioTestCase):
+@unittest.skipUnless(_live_tests_enabled(), "Set RUN_LIVE_OPENAI_TESTS=1 to run live OpenAI tests.")
+class OpenAIToolCallingLiveTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         load_dotenv(dotenv_path=".env")
-        api_key = os.getenv("SARVAM_API_KEY")
+        api_key = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
         if not api_key:
-            self.skipTest("SARVAM_API_KEY not set in environment/.env")
-        self.client = AsyncSarvamAI(api_subscription_key=api_key)
+            self.skipTest("API_KEY not set in environment/.env")
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=os.getenv("BASE_URL") or os.getenv("OPENAI_BASE_URL") or None,
+        )
+        self.model_name = (
+            os.getenv("MODEL_NAME")
+            or os.getenv("OPENAI_MODEL_NAME")
+            or os.getenv("OPENAI_MODEL")
+            or "gpt-4.1-mini"
+        )
         self.tools = [
             {
                 "type": "function",
@@ -40,8 +49,8 @@ class SarvamToolCallingLiveTests(unittest.IsolatedAsyncioTestCase):
         ]
 
     async def test_required_tool_choice_returns_tool_call(self) -> None:
-        response = await self.client.chat.completions(
-            model="sarvam-30b",
+        response = await self.client.chat.completions.create(
+            model=self.model_name,
             messages=[
                 {
                     "role": "system",
@@ -64,8 +73,8 @@ class SarvamToolCallingLiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("focus", parsed_args)
 
     async def test_tool_call_round_trip_produces_final_answer(self) -> None:
-        first = await self.client.chat.completions(
-            model="sarvam-30b",
+        first = await self.client.chat.completions.create(
+            model=self.model_name,
             messages=[
                 {"role": "system", "content": "Use tools for live Nepal macro questions."},
                 {"role": "user", "content": "नेपालको मुद्रास्फीति अपडेट देऊ"},
@@ -87,8 +96,8 @@ class SarvamToolCallingLiveTests(unittest.IsolatedAsyncioTestCase):
             "source": "NRB via NepalOSINT",
         }
 
-        second = await self.client.chat.completions(
-            model="sarvam-30b",
+        second = await self.client.chat.completions.create(
+            model=self.model_name,
             messages=[
                 {"role": "system", "content": "Answer in concise Nepali and include source mention."},
                 {"role": "user", "content": "नेपालको मुद्रास्फीति अपडेट देऊ"},
