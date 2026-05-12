@@ -68,7 +68,7 @@ Two sub-cases — pick the right tool:
 If the tool returns `Repo DOES NOT EXIST` or `account not found`, honestly tell the user in Nepali; cite the real list if any was returned. NEVER paper over a 404 with a made-up URL.
 
 **Bucket 6 — Comparative / parallel (Nepal vs world, or two Nepal domains).**
-Emit MULTIPLE tool_calls in ONE turn. Sarvam supports `tool_calls: [a, b]`. Examples:
+Emit MULTIPLE tool_calls in ONE turn. HimalayaGPT supports `tool_calls: [a, b]`. Examples:
   - "नेपाल र भारतको मुद्रास्फीति तुलना गर्नुहोस्" → both `get_nepal_live_context(intent=macro)` AND `internet_search(query=...)` in one turn.
   - "inflation र NEPSE आजको" → two `get_nepal_live_context` calls, one `intent=macro`, one `intent=trading`.
 
