@@ -1,10 +1,10 @@
 # YetiDai
 
-A Discord agent powered by Sarvam AI that integrates natively with external tools like NepalOSINT for live news, macroeconomic data, and public information.
+A Discord agent powered by an OpenAI-compatible API that integrates natively with external tools like NepalOSINT for live news, macroeconomic data, and public information.
 
 ## Architecture
 
-YetiDai uses a **multi-turn tool-calling architecture** and relies on Sarvam AI's native `tool_choice="auto"` feature. Instead of explicitly trying to figure out intent with keywords, the bot exposes a **Tool Registry** to the LLM. 
+YetiDai uses a **multi-turn tool-calling architecture** and relies on the OpenAI-compatible `tool_choice="auto"` feature. Instead of explicitly trying to figure out intent with keywords, the bot exposes a **Tool Registry** to the LLM. 
 
 The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal_live_context`, intelligently selects which tools to call, and waits for YetiDai to execute them via the registry before producing the final formatted Nepali response.
 
@@ -19,7 +19,7 @@ The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal
 ### Prerequisites
 - Python 3.8 or higher.
 - A Discord Bot Token from the [Discord Developer Portal](https://discord.com/developers/applications).
-- An API Key from the [Sarvam AI Dashboard](https://dashboard.sarvam.ai/).  
+- An API Key from an OpenAI-compatible provider.
 - optional [our model usages pre-trained model trained from himalayan ai nepali text corpus dataset (https://huggingface.co/datasets/himalaya-ai/nepali-corpus-compile)]
 
 ### Installation
@@ -32,7 +32,10 @@ The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal
 3. Create `.env` from the example values below:
    ```bash
    DISCORD_TOKEN=your-discord-bot-token
-   SARVAM_API_KEY=your-sarvam-api-key
+   API_KEY=your-openai-api-key
+   BASE_URL=https://api.openai.com/v1
+   MODEL_NAME=gpt-4.1-mini
+   TIME_OUT_SECONDS=25
    NEPALOSINT_BASE_URL=https://nepalosint.com/api/v1
    NEPALOSINT_PUBLIC_AUTH_ENABLED=true
    NEPALOSINT_TIMEOUT_SECONDS=8

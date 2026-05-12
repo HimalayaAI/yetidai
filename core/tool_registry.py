@@ -74,7 +74,7 @@ class ToolRegistry:
         Build the `tools` array for `chat.completions(tools=...)`.
 
         Output format matches what Sarvam expects — see
-        tests/test_sarvam_tool_calling_live.py for reference.
+        tests/test_openai_tool_calling_live.py for reference.
         """
         return [
             s.to_openai_tool()

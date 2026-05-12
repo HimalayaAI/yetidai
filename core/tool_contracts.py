@@ -1,10 +1,10 @@
 """
 core/tool_contracts.py — Pydantic models for the YetiDai tool-calling framework.
 
-These models mirror the OpenAI / Sarvam function-calling schema so the
-registry can auto-generate the `tools` array for chat.completions().
+These models mirror the OpenAI function-calling schema so the registry can
+auto-generate the `tools` array for chat.completions().
 
-Reference: tests/test_sarvam_tool_calling_live.py for the wire format.
+Reference: tests/test_openai_tool_calling_live.py for the wire format.
 """
 from __future__ import annotations
 
@@ -83,9 +83,9 @@ class ToolSpec(BaseModel):
 
     def to_openai_tool(self) -> dict[str, Any]:
         """
-        Convert to the dict Sarvam expects in the `tools` array.
+        Convert to the dict OpenAI expects in the `tools` array.
 
-        Matches the schema used in test_sarvam_tool_calling_live.py:
+        Matches the schema used in test_openai_tool_calling_live.py:
             {"type": "function", "function": {"name": ..., "parameters": {...}}}
         """
         properties: dict[str, Any] = {}
@@ -142,7 +142,7 @@ class ToolResult(BaseModel):
         """
         Format as a `role: tool` message for the Sarvam chat API.
 
-        Wire format (from test_sarvam_tool_calling_live.py):
+        Wire format (from test_openai_tool_calling_live.py):
             {
                 "role": "tool",
                 "tool_call_id": "<id>",

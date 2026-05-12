@@ -3,12 +3,14 @@ bot.py — YetiDai Discord bot with tool-calling support.
 
 Flow:
     1. User sends message → bot builds message list
-    2. Sends to Sarvam with tools array from the ToolRegistry
-    3. If Sarvam returns tool_calls → execute via registry → send results back
-    4. Sarvam produces final text answer → bot sends to Discord
+    2. Sends to an OpenAI-compatible chat-completions endpoint with tools
+       array from the ToolRegistry
+    3. If the model returns tool_calls → execute via registry → send results back
+    4. The model produces final text answer → bot sends to Discord
 
-Backend: Sarvam (`sarvam-30b`) via the `sarvamai` async client. Configured
-through `SARVAM_API_KEY` in the environment.
+Backend: OpenAI-compatible chat completions via the `openai` async client.
+Configured through `API_KEY`, `BASE_URL`, `MODEL_NAME`, and
+`TIME_OUT_SECONDS` in the environment.
 
 Tool-loop design (mirrors Anthropic's "let the model decide" model):
   - Parallel tool execution per round via asyncio.gather. Anthropic's SDK
@@ -49,7 +51,7 @@ import uuid
 
 import discord
 from dotenv import load_dotenv
-from sarvamai import AsyncSarvamAI
+from openai import AsyncOpenAI
 
 from functionality import functional
 
@@ -94,6 +96,7 @@ from core.bot_helpers import (
     tool_calls_signature,
     with_turn_id,
 )
+from tools.osint.retrieval_planner import _is_smalltalk
 
 # ── Register plugins ──────────────────────────────────────────────
 import tools.osint.plugin as osint_plugin
@@ -113,19 +116,74 @@ logger = logging.getLogger("yetidai")
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
+API_KEY = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
+BASE_URL = os.getenv("BASE_URL") or os.getenv("OPENAI_BASE_URL")
+LLM_MODEL = (
+    os.getenv("MODEL_NAME")
+    or os.getenv("OPENAI_MODEL_NAME")
+    or os.getenv("OPENAI_MODEL")
+    or "gpt-4.1-mini"
+)
+TIME_OUT_SECONDS = float(
+    os.getenv("TIME_OUT_SECONDS")
+    or os.getenv("OPENAI_TIMEOUT_SECONDS")
+    or "25"
+)
 
-llm_client = AsyncSarvamAI(api_subscription_key=SARVAM_API_KEY)
-LLM_MODEL = os.getenv("SARVAM_ROUTER_MODEL", "sarvam-30b")
-SARVAM_TIMEOUT_SECONDS = float(os.getenv("SARVAM_TIMEOUT_SECONDS", "25"))
-YETI_BACKEND = "sarvam"
+if not API_KEY:
+    raise RuntimeError(
+        "Missing API key. Set API_KEY or OPENAI_API_KEY in your environment/.env."
+    )
+
+llm_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL or None)
+YETI_BACKEND = "openai"
 logger.info(
-    "Using Sarvam backend (model=%s, timeout=%.1fs).",
-    LLM_MODEL, SARVAM_TIMEOUT_SECONDS,
+    "Using OpenAI-compatible backend (base_url=%s model=%s timeout=%.1fs).",
+    BASE_URL or "default",
+    LLM_MODEL, TIME_OUT_SECONDS,
 )
 
 with open("systemPrompt.txt", "r", encoding="utf-8") as f:
     SYSTEM_PROMPT = f.read()
+
+
+def _build_runtime_system_prompt() -> str:
+    """Return a compact prompt that fits small context-window backends.
+
+    The repository keeps the long canonical prompt in systemPrompt.txt for
+    reference, but low-context llama-server backends can reject a request
+    if we send that file verbatim. This runtime prompt preserves the core
+    routing and style rules while trimming examples and repeated guidance.
+    """
+    return (
+        "You are Yeti (यती), a warm, witty Nepali-language Discord assistant "
+        "built by Himalaya AI Research Lab (HARL).\n\n"
+        "Reply only in Nepali (Devanagari). Keep small talk short and human. "
+        "Use relaxed Nepali, not corporate chatbot language. Use ASCII digits "
+        "only inside URLs; otherwise convert digits to Devanagari in the final "
+        "answer.\n\n"
+        "Core rules: never guess current Nepal facts from memory; use tools for "
+        "anything that could have changed. Prefer NepalOSINT for Nepal facts. "
+        "Use internet_search for non-Nepal current events. Use fetch_url for a "
+        "specific pasted URL. For GitHub, never invent repo URLs; use "
+        "analyze_github_repo or list_github_repos.\n\n"
+        "Routing: small talk needs no tool. Nepal factual questions use "
+        "get_nepal_live_context with the most specific intent "
+        "(macro, trading, debt, government, parliament, general_news, who_is, "
+        "history). Comparative Nepal/world questions may use multiple tool "
+        "calls in parallel.\n\n"
+        "Freshness: if NepalOSINT returns stale data, acknowledge it and use "
+        "web results as primary. Never pad counts with duplicates. If the user "
+        "corrects you, re-route instead of repeating the old answer.\n\n"
+        "Tool policy: never announce intent, never refuse a factual question "
+        "before calling a tool, and always cite tool-backed answers with a "
+        "short स्रोत: line containing real URLs or endpoint names.\n\n"
+        "Tone: warm, polite, sharp on facts. Short replies for small talk, "
+        "concise factual replies elsewhere."
+    )
+
+
+SYSTEM_PROMPT = _build_runtime_system_prompt()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -283,7 +341,7 @@ async def _execute_tool_call(
 
 
 async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
-    """One Sarvam round-trip with timeout and one transient retry.
+    """One OpenAI round-trip with timeout and one transient retry.
 
     Raises the last exception if both attempts fail. Non-transient errors
     (auth, schema, ...) raise on the first attempt with no retry.
@@ -292,23 +350,23 @@ async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
     for attempt in range(2):
         try:
             return await asyncio.wait_for(
-                llm_client.chat.completions(
+                llm_client.chat.completions.create(
                     model=LLM_MODEL,
                     messages=messages,
                     tools=tools_array if tools_array else None,
                     tool_choice=tool_choice if tools_array else None,
                 ),
-                timeout=SARVAM_TIMEOUT_SECONDS,
+                timeout=TIME_OUT_SECONDS,
             )
         except asyncio.TimeoutError as exc:
             last_exc = exc
-            logger.warning("Sarvam timeout (attempt %d/2)", attempt + 1)
+            logger.warning("OpenAI timeout (attempt %d/2)", attempt + 1)
         except Exception as exc:
             if not is_transient_llm_error(exc):
                 raise
             last_exc = exc
             logger.warning(
-                "Sarvam transient error (attempt %d/2): %s", attempt + 1, exc,
+                "OpenAI transient error (attempt %d/2): %s", attempt + 1, exc,
             )
         if attempt == 0:
             await asyncio.sleep(0.5 + random.random() * 0.5)
@@ -333,6 +391,16 @@ async def on_message(message):
     if not chad.user_input:
         return
 
+    # Fast path: greetings and chit-chat should never go through the full
+    # tool loop. The backend here has a tiny context window, and sending a
+    # simple hello through the LLM often produces refusal/apology noise.
+    if _is_smalltalk(chad.user_input):
+        try:
+            await message.channel.send("ए हजुर 🙂 के छ?")
+        except Exception:
+            logger.exception("Failed to send small-talk reply")
+        return
+
     async with message.channel.typing():
         turn_id = uuid.uuid4().hex[:8]
         t0 = time.time()
@@ -354,12 +422,16 @@ async def on_message(message):
         # ── Build message list ────────────────────────────────────
         try:
             previous_messages = await chad.get_message_history(
-                message.channel, limit=5,
+                message.channel, limit=2,
             )
 
             today = datetime.date.today()
             date_block = build_date_block(today)
-            dynamic_system_prompt = f"{SYSTEM_PROMPT}\n\n{date_block}"
+            dynamic_system_prompt = (
+                f"{SYSTEM_PROMPT}\n\n"
+                f"Today: {today.isoformat()} AD.\n"
+                f"{date_block.splitlines()[0] if date_block else ''}"
+            )
             messages = [{"role": "system", "content": dynamic_system_prompt}]
 
             # Per-message try/except: one weird Discord message (None

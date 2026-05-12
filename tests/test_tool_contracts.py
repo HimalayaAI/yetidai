@@ -42,7 +42,7 @@ class ToolSpecTests(unittest.TestCase):
         )
 
     def test_to_openai_tool_shape(self) -> None:
-        """Must match the schema Sarvam expects (see test_sarvam_tool_calling_live.py)."""
+        """Must match the schema the OpenAI-compatible client expects."""
         tool = self._make_spec().to_openai_tool()
 
         self.assertEqual(tool["type"], "function")

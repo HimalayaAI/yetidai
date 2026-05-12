@@ -1,10 +1,10 @@
-// YetiDai end-to-end flow: Discord user message → Sarvam (primary) → tools → final Nepali answer.
+// YetiDai end-to-end flow: Discord user message → OpenAI-compatible LLM (primary) → tools → final Nepali answer.
 // Render: dot -Tpng docs/flowchart.dot -o docs/flowchart.png
 digraph YetiDaiFlow {
   rankdir=TB;
   graph [bgcolor="#0e1116", fontname="Helvetica", fontsize=14, splines=spline,
          nodesep=0.55, ranksep=0.95, pad=0.6, dpi=180, size="24,30",
-         labelloc=t, label=<<b><font color="#F6F7F9" point-size="22">YetiDai — Discord → Sarvam AI → NepalOSINT → final Nepali answer</font></b>>];
+         labelloc=t, label=<<b><font color="#F6F7F9" point-size="22">YetiDai — Discord → OpenAI-compatible LLM → NepalOSINT → final Nepali answer</font></b>>];
   node  [fontname="Helvetica", fontsize=12, style="filled,rounded", shape=box,
          color="#404854", fontcolor="#F6F7F9", penwidth=1.4, margin="0.20,0.12"];
   edge  [fontname="Helvetica", fontsize=10, color="#8A9BA8", fontcolor="#C5CBD3", penwidth=1.2];
@@ -23,14 +23,14 @@ digraph YetiDaiFlow {
 
   // ── LLM ────────────────────────────────────────────────
   subgraph cluster_llm {
-    label=<<b><font color="#8ABBFF">Sarvam AI — tool-calling loop (up to MAX_TOOL_ROUNDS = 5)</font></b>>;
+    label=<<b><font color="#8ABBFF">OpenAI-compatible LLM — tool-calling loop (up to MAX_TOOL_ROUNDS = 5)</font></b>>;
     style="rounded,dashed"; color="#2D72D2"; bgcolor="#141923";
 
-    sarvam    [label=<<b>Sarvam AI</b><br/>
-AsyncSarvamAI — model=<b>sarvam-30b</b><br align="left"/>
+    openai    [label=<<b>OpenAI-compatible LLM</b><br/>
+AsyncOpenAI — model=<b>MODEL_NAME</b><br align="left"/>
 native OpenAI-style tool_calling<br align="left"/>
 tool_choice="auto"<br align="left"/>
-env: SARVAM_API_KEY<br align="left"/>>,
+env: API_KEY / BASE_URL<br align="left"/>>,
                fillcolor="#1F4B99", fontcolor="#FFFFFF", color="#2D72D2", penwidth=2.5];
 
     decide    [label=<<b>finish_reason?</b>>, shape=diamond,
@@ -151,9 +151,9 @@ writes Nepali answer:<br align="left"/>
 
   // ── Edges ──────────────────────────────────────────────
   user     -> botctx;
-  botctx   -> sarvam [penwidth=2];
+  botctx   -> openai [penwidth=2];
 
-  sarvam   -> decide [penwidth=2];
+  openai   -> decide [penwidth=2];
 
   decide   -> b1 [label="stop\n(no tool_calls)"];
   decide   -> b2 [label="tool_calls →\nget_nepal_live_context", penwidth=2];
