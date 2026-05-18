@@ -103,11 +103,19 @@ import tools.osint.plugin as osint_plugin
 import tools.search.plugin as search_plugin
 import tools.fetch.plugin as fetch_plugin
 import tools.github.plugin as github_plugin
+import tools.social.plugin as social_plugin
+from tools.social.twitter_feed import (
+    SocialFeedConfig,
+    SocialFeedService,
+    SocialTweet,
+    load_social_feed_config,
+)
 
 osint_plugin.register()
 search_plugin.register()
 fetch_plugin.register()
 github_plugin.register()
+social_plugin.register()
 # ── Initialization ────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -166,7 +174,8 @@ def _build_runtime_system_prompt() -> str:
         "anything that could have changed. Prefer NepalOSINT for Nepal facts. "
         "Use internet_search for non-Nepal current events. Use fetch_url for a "
         "specific pasted URL. For GitHub, never invent repo URLs; use "
-        "analyze_github_repo or list_github_repos.\n\n"
+        "analyze_github_repo or list_github_repos. For the Discord social "
+        "feed, AI handles, or recent scraped tweets, use get_social_media_feed.\n\n"
         "Routing: small talk needs no tool. Nepal factual questions use "
         "get_nepal_live_context with the most specific intent "
         "(macro, trading, debt, government, parliament, general_news, who_is, "
@@ -192,12 +201,128 @@ bot = discord.Client(intents=intents)
 chad = functional(bot=bot)
 
 registry = get_registry()
+social_feed_config: SocialFeedConfig = load_social_feed_config()
+social_feed_service: SocialFeedService | None = None
+social_feed_task: asyncio.Task | None = None
 
 # Safety cap: max tool-call round-trips before forcing a text answer.
 MAX_TOOL_ROUNDS = 5
 # Per-tool wall-clock limit. Tools can override via ToolSpec.timeout_seconds
 # (slow aggregators) or be pinned lower for fast local lookups.
 YETI_TOOL_TIMEOUT = float(os.getenv("YETI_TOOL_TIMEOUT", "15"))
+
+
+def _normalize_channel_name(name: str) -> str:
+    """Normalize Discord channel names like '📱・social-media'."""
+    lowered = (name or "").strip().lower()
+    for sep in ("・", "•", "|", " "):
+        if sep in lowered:
+            lowered = lowered.split(sep)[-1]
+    return lowered
+
+
+def _find_social_channel() -> discord.abc.Messageable | None:
+    if social_feed_config.channel_id:
+        channel = bot.get_channel(social_feed_config.channel_id)
+        if channel is not None:
+            return channel
+
+    wanted = social_feed_config.channel_name.strip().lower()
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            raw_name = channel.name.lower()
+            normalized = _normalize_channel_name(channel.name)
+            if raw_name == wanted or normalized == wanted or raw_name.endswith(wanted):
+                return channel
+    return None
+
+
+def _build_social_feed_message(tweet: SocialTweet) -> tuple[str | None, list[discord.Embed]]:
+    content = None
+    if tweet.video_urls:
+        content = "Video:\n" + "\n".join(tweet.video_urls[:4])
+
+    description = tweet.text[:3900]
+    if len(tweet.text) > len(description):
+        description = f"{description}..."
+
+    embed = discord.Embed(
+        title=f"@{tweet.author_username}",
+        url=tweet.x_url,
+        description=description,
+        color=0x5865F2,
+        timestamp=tweet.tweeted_at or datetime.datetime.now(datetime.timezone.utc),
+    )
+    embed.set_author(name=tweet.author_name or tweet.author_username)
+    embed.add_field(
+        name="Engagement",
+        value=(
+            f"Replies {tweet.reply_count} | Reposts {tweet.retweet_count} | "
+            f"Quotes {tweet.quote_count} | Likes {tweet.like_count}"
+        ),
+        inline=False,
+    )
+    embed.add_field(name="Link", value=f"[Open on X]({tweet.x_url})", inline=False)
+    preview_images = tweet.media_urls or tweet.video_thumb_urls
+    if preview_images:
+        embed.set_image(url=preview_images[0])
+    embed.set_footer(text=f"YetiDai social feed via {tweet.instance_url or 'Nitter'}")
+
+    embeds = [embed]
+    for media_url in preview_images[1:4]:
+        media_embed = discord.Embed(url=tweet.x_url, color=0x5865F2)
+        media_embed.set_image(url=media_url)
+        embeds.append(media_embed)
+    return content, embeds
+
+
+async def _run_social_feed() -> None:
+    global social_feed_service
+    await bot.wait_until_ready()
+    channel = None
+    if social_feed_service is None:
+        social_feed_service = SocialFeedService(config=social_feed_config)
+    logger.info("Starting social feed poster")
+    while not bot.is_closed():
+        try:
+            if channel is None:
+                channel = _find_social_channel()
+                if channel is None:
+                    logger.warning(
+                        "Social feed enabled but no channel matched id=%s name=%r",
+                        social_feed_config.channel_id,
+                        social_feed_config.channel_name,
+                    )
+                    await asyncio.sleep(social_feed_config.poll_seconds)
+                    continue
+                logger.info("Social feed target channel resolved: %s", getattr(channel, "id", "unknown"))
+
+            result = await social_feed_service.poll_once()
+            if result.marked_seen:
+                logger.info("Social feed marked %d existing tweets as seen", result.marked_seen)
+            if result.errors:
+                logger.warning("Social feed scrape warnings: %s", result.errors[:5])
+            for tweet in result.tweets_to_post:
+                if social_feed_service.store.is_seen(tweet.tweet_id):
+                    continue
+                social_feed_service.mark_seen_unposted(tweet)
+                content, embeds = _build_social_feed_message(tweet)
+                try:
+                    await channel.send(
+                        content=content,
+                        embeds=embeds,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                except Exception:
+                    logger.exception("Failed to post social tweet %s", tweet.tweet_id)
+                else:
+                    social_feed_service.mark_posted(tweet)
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Social feed poll failed")
+        await asyncio.sleep(social_feed_config.poll_seconds)
 
 
 async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
@@ -377,9 +502,12 @@ async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
 
 @bot.event
 async def on_ready():
+    global social_feed_task
     tool_names = [t.name for t in registry.list_tools()]
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
     logger.info("Registered tools: %s", tool_names)
+    if social_feed_config.enabled and social_feed_task is None:
+        social_feed_task = asyncio.create_task(_run_social_feed())
 
 
 @bot.event

@@ -13,6 +13,7 @@ The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal
 - **`core/tool_contracts.py`**: Pydantic models mapping tool requirements (e.g. `ToolSpec`, `ToolParam`, `ToolResult`).
 - **`core/tool_registry.py`**: A thread-safe Tool Registry that tracks tools, handles asynchronous executions, and generates the `tools` array for the API client.
 - **`tools/osint/plugin.py`**: The NepalOSINT plugin which encapsulates retrieving recent Nepal news, macro data, public debt clocks, missing information, etc.
+- **`tools/social/`**: A Nitter-backed social-media feed that automatically posts new AI/X account updates into `#social-media` and exposes the same feed state to YetiDai through `get_social_media_feed`.
 
 ## Setup
 
@@ -40,9 +41,41 @@ The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal
    NEPALOSINT_PUBLIC_AUTH_ENABLED=true
    NEPALOSINT_TIMEOUT_SECONDS=8
    NEPALOSINT_MAX_CONTEXT_ITEMS=8
+   YETI_SOCIAL_FEED_ENABLED=true
+   YETI_SOCIAL_CHANNEL_NAME=social-media
    ```
 
 *(Note: `NEPALOSINT_*` variables are optional and default to the public API).*
+
+### Automatic Social-Media Feed
+
+YetiDai can post new X/Twitter updates into a Discord social-media channel without waiting for a user prompt. It uses public Nitter instances, stores seen tweet IDs in SQLite, and posts only new, direct timeline posts from the configured accounts.
+
+Default behavior:
+
+- Watches the AI account list in `tools/social/twitter_feed.py`.
+- Finds `#social-media` automatically, including emoji-prefixed names such as `📱・social-media`.
+- Marks currently visible tweets as seen on first run, so startup does not spam old posts.
+- Persists state in `logs/social_feed.sqlite3`; no main database is required.
+- Sends images as embeds and video posts as direct video links plus thumbnail embeds.
+
+Useful environment variables:
+
+```bash
+YETI_SOCIAL_FEED_ENABLED=true
+YETI_SOCIAL_CHANNEL_ID=
+YETI_SOCIAL_CHANNEL_NAME=social-media
+YETI_SOCIAL_POLL_SECONDS=300
+YETI_SOCIAL_STATE_DB=logs/social_feed.sqlite3
+YETI_SOCIAL_POST_EXISTING_ON_FIRST_RUN=false
+YETI_SOCIAL_MAX_POSTS_PER_POLL=25
+YETI_SOCIAL_ACCOUNTS=karpathy,fchollet,ylecun,AndrewYNg,rasbt,dair_ai,lilianweng,jeremyphoward,simonw,_akhaliq,ID_AA_Carmack,gwern,goodside,drfeifei,demishassabis,sama,nlethetech,HimalayaAILabs
+YETI_SOCIAL_NITTER_INSTANCES=https://nitter.poast.org,https://nitter.privacydev.net
+YETI_SOCIAL_INCLUDE_RETWEETS=false
+YETI_SOCIAL_INCLUDE_REPLIES=false
+```
+
+YetiDai also registers `get_social_media_feed` as a normal auto tool-call. When users ask what the AI handles or social feed are saying, the model can read recent stored posts without triggering a fresh scrape.
 
 ## Running the Bot
 
