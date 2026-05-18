@@ -25,6 +25,20 @@ from bs4 import BeautifulSoup
 logger = logging.getLogger("yetidai.social")
 
 DEFAULT_AI_ACCOUNTS = [
+    "OpenAI",
+    "AnthropicAI",
+    "GoogleDeepMind",
+    "GoogleAI",
+    "AIatMeta",
+    "MistralAI",
+    "xai",
+    "huggingface",
+    "perplexity_ai",
+    "cohere",
+    "NVIDIAAI",
+    "MicrosoftAI",
+    "StabilityAI",
+    "Gradio",
     "karpathy",
     "fchollet",
     "ylecun",
