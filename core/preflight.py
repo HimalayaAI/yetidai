@@ -16,11 +16,12 @@ has the data in hand and only has to write the Nepali summary.
 Deterministic preflight rules (match order matters):
   1. Bare GitHub URL in message      → analyze_github_repo
   2. Any other http(s) URL           → fetch_url
-  3. Minister role detected          → get_nepal_live_context(government, who_is)
-  4. Clear "news" / samachar / khabar → get_nepal_live_context(general_news)
-  5. GDP / macro keyword             → get_nepal_live_context(macro) + web fallback note
-  6. NEPSE ticker + trading context  → get_nepal_live_context(trading)
-  7. Cabinet / decisions             → get_nepal_live_context(government)
+  3. Social feed / AI handles        → get_social_media_feed
+  4. Minister role detected          → get_nepal_live_context(government, who_is)
+  5. Clear "news" / samachar / khabar → get_nepal_live_context(general_news)
+  6. GDP / macro keyword             → get_nepal_live_context(macro) + web fallback note
+  7. NEPSE ticker + trading context  → get_nepal_live_context(trading)
+  8. Cabinet / decisions             → get_nepal_live_context(government)
 
 Returns None when no rule matches — the normal tool-loop handles the
 query.
@@ -88,6 +89,14 @@ _COMMAND_STRIP_RE = re.compile(
     re.IGNORECASE,
 )
 
+_SOCIAL_FEED_RE = re.compile(
+    r"\b(social[-\s]?media|social\s*feed|twitter|x\.com|tweets?|"
+    r"ai\s*handles?|karpathy|sama|lilianweng|goodside|dair_ai|"
+    r"himalayaailabs|nlethetech)\b",
+    re.IGNORECASE,
+)
+_SOCIAL_FEED_DEV_RE = re.compile(r"(ट्वीट|सोसल|सामाजिक\s*सञ्जाल)")
+
 
 def _strip_command_tokens(text: str) -> str:
     """Remove imperative words so 'web search garnus Nepal PM' becomes
@@ -147,6 +156,12 @@ def plan_preflight(user_text: str | None) -> tuple[str, dict[str, Any]] | None:
     # "web search garnus", "google garera heru na", "online khoju".
     if _EXPLICIT_WEB_SEARCH_RE.search(lowered):
         return ("internet_search", {"query": _strip_command_tokens(text)})
+
+    # 1b. YetiDai's local #social-media feed state. This is not a live
+    # web search; it reads what the automatic background poster has
+    # already scraped and stored.
+    if _SOCIAL_FEED_RE.search(text) or _SOCIAL_FEED_DEV_RE.search(text):
+        return ("get_social_media_feed", {"limit": 10})
 
     # 2. Minister role → government + who_is. For "current / अहिले"
     #    identity queries, parallel-fire a web search because Wikipedia
