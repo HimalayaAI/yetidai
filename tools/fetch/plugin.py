@@ -113,20 +113,25 @@ async def handle_fetch(ctx: ToolContext, arguments: dict[str, Any]) -> ToolResul
 
     try:
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT_SECONDS) as client:
-            resp = await client.get(
+            async with client.stream(
+                "GET",
                 url.strip(),
-                headers={"User-Agent": _UA, "Accept": "text/html,application/xhtml+xml"},
+                headers={
+                    "User-Agent": _UA,
+                    "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
+                },
                 follow_redirects=True,
-            )
-            resp.raise_for_status()
-            ctype = resp.headers.get("content-type", "").lower()
-            if "html" not in ctype and "text" not in ctype:
-                return ToolResult(
-                    tool_id=FETCH_SPEC.tool_id,
-                    success=False,
-                    error=f"unsupported content-type: {ctype or 'unknown'}",
-                )
-            text = _extract_main_text(resp.text, cap=MAX_CHARS)
+            ) as resp:
+                resp.raise_for_status()
+                ctype = resp.headers.get("content-type", "").lower()
+                if "html" not in ctype and "text" not in ctype:
+                    return ToolResult(
+                        tool_id=FETCH_SPEC.tool_id,
+                        success=False,
+                        error=f"unsupported content-type: {ctype or 'unknown'}",
+                    )
+                await resp.aread()
+                text = _extract_main_text(resp.text, cap=MAX_CHARS)
 
         if not text:
             return ToolResult(

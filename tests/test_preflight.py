@@ -23,6 +23,23 @@ class UrlPreflightTests(unittest.TestCase):
         self.assertEqual(plan[0], "fetch_url")
         self.assertIn("nrb.org.np", plan[1]["url"])
 
+    def test_github_url_wins_when_video_url_appears_first(self) -> None:
+        plan = plan_preflight(
+            "Video:\n"
+            "https://video.twimg.com/ext_tw_video/2049915310275284992/pu/vid/avc1/test.mp4\n"
+            "can you look at it https://github.com/HimalayaAI/yetidai"
+        )
+        self.assertEqual(plan[0], "analyze_github_repo")
+        self.assertEqual(plan[1]["repo"], "https://github.com/HimalayaAI/yetidai")
+
+    def test_twitter_media_url_does_not_hijack_social_feed_request(self) -> None:
+        plan = plan_preflight(
+            "twitter live updates not just this video "
+            "https://video.twimg.com/ext_tw_video/123/vid/avc1/test.mp4"
+        )
+        self.assertEqual(plan[0], "get_social_media_feed")
+        self.assertTrue(plan[1]["refresh"])
+
 
 class MinisterPreflightTests(unittest.TestCase):
     def test_hm_resign(self) -> None:

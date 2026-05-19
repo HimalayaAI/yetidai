@@ -28,33 +28,13 @@ DEFAULT_AI_ACCOUNTS = [
     "OpenAI",
     "AnthropicAI",
     "GoogleDeepMind",
-    "GoogleAI",
-    "AIatMeta",
-    "MistralAI",
     "xai",
+    "MistralAI",
     "huggingface",
-    "perplexity_ai",
-    "cohere",
-    "NVIDIAAI",
-    "MicrosoftAI",
-    "StabilityAI",
-    "Gradio",
-    "karpathy",
-    "fchollet",
-    "ylecun",
-    "AndrewYNg",
-    "rasbt",
-    "dair_ai",
-    "lilianweng",
-    "jeremyphoward",
-    "simonw",
-    "_akhaliq",
-    "ID_AA_Carmack",
-    "gwern",
-    "goodside",
-    "drfeifei",
-    "demishassabis",
     "sama",
+    "karpathy",
+    "simonw",
+    "goodside",
     "nlethetech",
     "HimalayaAILabs",
 ]
@@ -69,13 +49,14 @@ class SocialFeedConfig:
     accounts: list[str] = field(default_factory=lambda: list(DEFAULT_AI_ACCOUNTS))
     nitter_instances: list[str] = field(default_factory=lambda: [
         "https://nitter.poast.org",
-        "https://nitter.privacydev.net",
     ])
-    poll_seconds: int = 300
+    poll_seconds: int = 180
     request_timeout_seconds: int = 30
     delay_between_requests: float = 2.0
     max_timeline_pages: int = 1
-    max_posts_per_poll: int = 25
+    max_posts_per_poll: int = 10
+    live_refresh_accounts: int = 12
+    live_refresh_concurrency: int = 4
     post_existing_on_first_run: bool = False
     include_retweets: bool = False
     include_replies: bool = False
@@ -159,10 +140,12 @@ def load_social_feed_config() -> SocialFeedConfig:
             "YETI_SOCIAL_NITTER_INSTANCES",
             ["https://nitter.poast.org", "https://nitter.privacydev.net"],
         ),
-        poll_seconds=_env_int("YETI_SOCIAL_POLL_SECONDS", 300),
+        poll_seconds=_env_int("YETI_SOCIAL_POLL_SECONDS", 180),
         request_timeout_seconds=_env_int("YETI_SOCIAL_REQUEST_TIMEOUT_SECONDS", 30),
         max_timeline_pages=_env_int("YETI_SOCIAL_MAX_TIMELINE_PAGES", 1),
-        max_posts_per_poll=_env_int("YETI_SOCIAL_MAX_POSTS_PER_POLL", 25),
+        max_posts_per_poll=_env_int("YETI_SOCIAL_MAX_POSTS_PER_POLL", 10),
+        live_refresh_accounts=_env_int("YETI_SOCIAL_LIVE_REFRESH_ACCOUNTS", 12),
+        live_refresh_concurrency=_env_int("YETI_SOCIAL_LIVE_REFRESH_CONCURRENCY", 4),
         post_existing_on_first_run=_env_bool("YETI_SOCIAL_POST_EXISTING_ON_FIRST_RUN", False),
         include_retweets=_env_bool("YETI_SOCIAL_INCLUDE_RETWEETS", False),
         include_replies=_env_bool("YETI_SOCIAL_INCLUDE_REPLIES", False),
@@ -188,10 +171,19 @@ class SocialFeedStore:
                 video_urls_json TEXT NOT NULL DEFAULT '[]',
                 video_thumb_urls_json TEXT NOT NULL DEFAULT '[]',
                 first_seen_at TEXT NOT NULL,
-                posted_at TEXT
+                posted_at TEXT,
+                auto_post_eligible INTEGER NOT NULL DEFAULT 1
             )
             """
         )
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(social_tweets)").fetchall()
+        }
+        if "auto_post_eligible" not in columns:
+            self._conn.execute(
+                "ALTER TABLE social_tweets ADD COLUMN auto_post_eligible INTEGER NOT NULL DEFAULT 1"
+            )
         self._conn.commit()
 
     def is_seen(self, tweet_id: str) -> bool:
@@ -201,7 +193,27 @@ class SocialFeedStore:
         ).fetchone()
         return row is not None
 
-    def mark_seen(self, tweet: SocialTweet, source_label: str, *, posted: bool) -> None:
+    def is_known_for_autopost(self, tweet_id: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT posted_at, auto_post_eligible
+            FROM social_tweets
+            WHERE tweet_id = ?
+            """,
+            (tweet_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(row["posted_at"]) or not bool(row["auto_post_eligible"])
+
+    def mark_seen(
+        self,
+        tweet: SocialTweet,
+        source_label: str,
+        *,
+        posted: bool,
+        auto_post_eligible: bool = True,
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         posted_at = now if posted else None
         tweeted_at = tweet.tweeted_at.isoformat() if tweet.tweeted_at else None
@@ -210,9 +222,10 @@ class SocialFeedStore:
             INSERT INTO social_tweets (
                 tweet_id, author_username, author_name, text, x_url, tweeted_at,
                 source_label, media_urls_json, video_urls_json,
-                video_thumb_urls_json, first_seen_at, posted_at
+                video_thumb_urls_json, first_seen_at, posted_at,
+                auto_post_eligible
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tweet_id) DO UPDATE SET
                 author_username = excluded.author_username,
                 author_name = excluded.author_name,
@@ -223,7 +236,11 @@ class SocialFeedStore:
                 media_urls_json = excluded.media_urls_json,
                 video_urls_json = excluded.video_urls_json,
                 video_thumb_urls_json = excluded.video_thumb_urls_json,
-                posted_at = COALESCE(social_tweets.posted_at, excluded.posted_at)
+                posted_at = COALESCE(social_tweets.posted_at, excluded.posted_at),
+                auto_post_eligible = CASE
+                    WHEN social_tweets.auto_post_eligible = 0 THEN 0
+                    ELSE excluded.auto_post_eligible
+                END
             """,
             (
                 tweet.tweet_id,
@@ -238,6 +255,7 @@ class SocialFeedStore:
                 json.dumps(tweet.video_thumb_urls),
                 now,
                 posted_at,
+                1 if auto_post_eligible else 0,
             ),
         )
         self._conn.commit()
@@ -262,6 +280,16 @@ class SocialFeedStore:
 
     def close(self) -> None:
         self._conn.close()
+
+
+def _unique_preserve_order(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
 
 
 @dataclass
@@ -484,9 +512,9 @@ class NitterScraper:
             retweet_count=stats[1] if len(stats) > 1 else 0,
             quote_count=stats[2] if len(stats) > 2 else 0,
             like_count=stats[3] if len(stats) > 3 else 0,
-            media_urls=media_urls,
-            video_urls=video_urls,
-            video_thumb_urls=video_thumb_urls,
+            media_urls=_unique_preserve_order(media_urls),
+            video_urls=_unique_preserve_order(video_urls),
+            video_thumb_urls=_unique_preserve_order(video_thumb_urls),
             instance_url=instance_url,
         )
 
@@ -529,6 +557,81 @@ class SocialFeedService:
         self.config = config or load_social_feed_config()
         self.store = store or SocialFeedStore(self.config.state_db_path)
         self._first_poll = True
+        self._refresh_offset = 0
+
+    def _is_tweet_allowed_for_account(self, tweet: SocialTweet, account: str) -> bool:
+        if not self.config.include_retweets and tweet.is_retweet:
+            return False
+        if not self.config.include_replies and tweet.is_reply:
+            return False
+        return tweet.author_username.lower() == account.lower()
+
+    async def refresh_recent(self, *, author: str | None = None) -> FeedPollResult:
+        """Fetch fresh timeline posts for tool answers without Discord posting.
+
+        The background poll can afford to scan every account sequentially. A
+        user-facing tool call cannot, so broad refreshes check a bounded number
+        of configured accounts concurrently. Exact-author refreshes scrape only
+        that author.
+        """
+        if author:
+            accounts = [author.lstrip("@")]
+        else:
+            configured = [item for item in self.config.accounts if item]
+            limit = max(1, min(self.config.live_refresh_accounts, len(configured)))
+            start = self._refresh_offset % len(configured) if configured else 0
+            rotated = configured[start:] + configured[:start]
+            accounts = rotated[:limit]
+            self._refresh_offset = (start + limit) % len(configured) if configured else 0
+        accounts = [item for item in accounts if item]
+        if not accounts:
+            return FeedPollResult([], scanned=0, marked_seen=0, errors=[])
+
+        errors: list[str] = []
+        tweets: list[SocialTweet] = []
+        scanned = 0
+        concurrency = max(1, min(self.config.live_refresh_concurrency, len(accounts)))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async with NitterScraper(self.config) as scraper:
+            async def scrape_account(account: str) -> tuple[str, ScrapeResult]:
+                async with semaphore:
+                    result = await scraper.scrape_user_timeline(
+                        account,
+                        is_known_tweet=self.store.is_seen,
+                    )
+                    return account, result
+
+            results = await asyncio.gather(*[scrape_account(account) for account in accounts])
+
+        for account, result in results:
+            if result.error:
+                errors.append(result.error)
+            for tweet in result.tweets:
+                scanned += 1
+                if self._is_tweet_allowed_for_account(tweet, account):
+                    tweets.append(tweet)
+
+        tweets_by_id: dict[str, SocialTweet] = {}
+        for tweet in tweets:
+            tweets_by_id.setdefault(tweet.tweet_id, tweet)
+        unique = list(tweets_by_id.values())
+        unique.sort(key=lambda item: item.tweeted_at or datetime.now(timezone.utc))
+
+        new_tweets = [tweet for tweet in unique if not self.store.is_seen(tweet.tweet_id)]
+        for tweet in new_tweets:
+            self.store.mark_seen(
+                tweet,
+                f"@{tweet.author_username}",
+                posted=False,
+                auto_post_eligible=True,
+            )
+        return FeedPollResult(
+            tweets_to_post=new_tweets,
+            scanned=scanned,
+            marked_seen=len(new_tweets),
+            errors=errors,
+        )
 
     async def poll_once(self) -> FeedPollResult:
         tweets: list[SocialTweet] = []
@@ -538,19 +641,14 @@ class SocialFeedService:
             for account in self.config.accounts:
                 result = await scraper.scrape_user_timeline(
                     account,
-                    is_known_tweet=self.store.is_seen,
+                    is_known_tweet=self.store.is_known_for_autopost,
                 )
                 if result.error:
                     errors.append(result.error)
                 for tweet in result.tweets:
                     scanned += 1
-                    if not self.config.include_retweets and tweet.is_retweet:
-                        continue
-                    if not self.config.include_replies and tweet.is_reply:
-                        continue
-                    if tweet.author_username.lower() != account.lower():
-                        continue
-                    tweets.append(tweet)
+                    if self._is_tweet_allowed_for_account(tweet, account):
+                        tweets.append(tweet)
                 await asyncio.sleep(self.config.delay_between_requests)
 
         tweets_by_id: dict[str, SocialTweet] = {}
@@ -560,16 +658,43 @@ class SocialFeedService:
         unique.sort(key=lambda item: item.tweeted_at or datetime.now(timezone.utc))
 
         if self._first_poll and not self.config.post_existing_on_first_run:
-            for tweet in unique:
-                self.store.mark_seen(tweet, f"@{tweet.author_username}", posted=False)
+            eligible_to_post = [
+                tweet for tweet in unique
+                if self.store.is_seen(tweet.tweet_id)
+                and not self.store.is_known_for_autopost(tweet.tweet_id)
+            ]
+            suppress_existing = [
+                tweet for tweet in unique
+                if not self.store.is_seen(tweet.tweet_id)
+            ]
+            for tweet in suppress_existing:
+                self.store.mark_seen(
+                    tweet,
+                    f"@{tweet.author_username}",
+                    posted=False,
+                    auto_post_eligible=False,
+                )
             self._first_poll = False
-            return FeedPollResult([], scanned=scanned, marked_seen=len(unique), errors=errors)
+            return FeedPollResult(
+                eligible_to_post,
+                scanned=scanned,
+                marked_seen=len(suppress_existing),
+                errors=errors,
+            )
 
         self._first_poll = False
-        new_tweets = [tweet for tweet in unique if not self.store.is_seen(tweet.tweet_id)]
+        new_tweets = [
+            tweet for tweet in unique
+            if not self.store.is_known_for_autopost(tweet.tweet_id)
+        ]
         skipped = max(0, len(new_tweets) - self.config.max_posts_per_poll)
         for tweet in new_tweets[:skipped]:
-            self.store.mark_seen(tweet, f"@{tweet.author_username}", posted=False)
+            self.store.mark_seen(
+                tweet,
+                f"@{tweet.author_username}",
+                posted=False,
+                auto_post_eligible=False,
+            )
         return FeedPollResult(
             tweets_to_post=new_tweets[skipped:],
             scanned=scanned,
@@ -578,10 +703,20 @@ class SocialFeedService:
         )
 
     def mark_posted(self, tweet: SocialTweet) -> None:
-        self.store.mark_seen(tweet, f"@{tweet.author_username}", posted=True)
+        self.store.mark_seen(
+            tweet,
+            f"@{tweet.author_username}",
+            posted=True,
+            auto_post_eligible=True,
+        )
 
     def mark_seen_unposted(self, tweet: SocialTweet) -> None:
-        self.store.mark_seen(tweet, f"@{tweet.author_username}", posted=False)
+        self.store.mark_seen(
+            tweet,
+            f"@{tweet.author_username}",
+            posted=False,
+            auto_post_eligible=True,
+        )
 
     def recent(self, *, limit: int = 10, author: str | None = None) -> list[dict]:
         return self.store.recent(limit=limit, author=author)
