@@ -65,17 +65,23 @@ Useful environment variables:
 YETI_SOCIAL_FEED_ENABLED=true
 YETI_SOCIAL_CHANNEL_ID=
 YETI_SOCIAL_CHANNEL_NAME=social-media
-YETI_SOCIAL_POLL_SECONDS=300
+YETI_SOCIAL_POLL_SECONDS=180
 YETI_SOCIAL_STATE_DB=logs/social_feed.sqlite3
 YETI_SOCIAL_POST_EXISTING_ON_FIRST_RUN=false
-YETI_SOCIAL_MAX_POSTS_PER_POLL=25
-YETI_SOCIAL_ACCOUNTS=OpenAI,AnthropicAI,GoogleDeepMind,GoogleAI,AIatMeta,MistralAI,xai,huggingface,perplexity_ai,cohere,NVIDIAAI,MicrosoftAI,StabilityAI,Gradio,karpathy,fchollet,ylecun,AndrewYNg,rasbt,dair_ai,lilianweng,jeremyphoward,simonw,_akhaliq,ID_AA_Carmack,gwern,goodside,drfeifei,demishassabis,sama,nlethetech,HimalayaAILabs
-YETI_SOCIAL_NITTER_INSTANCES=https://nitter.poast.org,https://nitter.privacydev.net
+YETI_SOCIAL_MAX_POSTS_PER_POLL=10
+YETI_SOCIAL_LIVE_REFRESH_ACCOUNTS=12
+YETI_SOCIAL_LIVE_REFRESH_CONCURRENCY=4
+YETI_SOCIAL_ACCOUNTS=OpenAI,AnthropicAI,GoogleDeepMind,xai,MistralAI,huggingface,sama,karpathy,simonw,goodside,nlethetech,HimalayaAILabs
+YETI_SOCIAL_NITTER_INSTANCES=https://nitter.poast.org
 YETI_SOCIAL_INCLUDE_RETWEETS=false
 YETI_SOCIAL_INCLUDE_REPLIES=false
 ```
 
-YetiDai also registers `get_social_media_feed` as a normal auto tool-call. When users ask what the AI handles or social feed are saying, the model can read recent stored posts without triggering a fresh scrape.
+YetiDai also registers `get_social_media_feed` as a normal auto tool-call. When users ask what the AI handles or social feed are saying, the model can do a bounded live refresh, store newly seen tweets, and then return recent feed items without repeating old tweet IDs. Exact-author requests refresh that one account; broad requests refresh a rotating slice of up to `YETI_SOCIAL_LIVE_REFRESH_ACCOUNTS` configured accounts concurrently.
+
+The automatic `#social-media` poster does not call the LLM. It polls Nitter directly, formats the tweet into Discord content/embeds, sends it to the configured channel, and then marks that tweet ID as posted.
+
+For reliability, keep `YETI_SOCIAL_NITTER_INSTANCES` to instances you have actually probed successfully. Many public Nitter mirrors now return bot-check pages or empty responses, so adding more instances is not automatically better.
 
 ## Running the Bot
 

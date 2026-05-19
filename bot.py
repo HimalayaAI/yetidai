@@ -240,7 +240,25 @@ def _find_social_channel() -> discord.abc.Messageable | None:
 def _build_social_feed_message(tweet: SocialTweet) -> tuple[str | None, list[discord.Embed]]:
     content = None
     if tweet.video_urls:
-        content = "Video:\n" + "\n".join(tweet.video_urls[:4])
+        seen_video_urls: set[str] = set()
+        video_urls: list[str] = []
+        for url in tweet.video_urls:
+            if url and url not in seen_video_urls:
+                seen_video_urls.add(url)
+                video_urls.append(url)
+            if len(video_urls) >= 4:
+                break
+        text_preview = tweet.text.replace("\n", " ").strip()
+        if len(text_preview) > 220:
+            text_preview = f"{text_preview[:217]}..."
+        content_parts = [
+            f"New X post from @{tweet.author_username}",
+            text_preview,
+            tweet.x_url,
+        ]
+        if video_urls:
+            content_parts.append("Video:\n" + "\n".join(video_urls))
+        content = "\n".join(part for part in content_parts if part)
 
     description = tweet.text[:3900]
     if len(tweet.text) > len(description):
@@ -303,7 +321,7 @@ async def _run_social_feed() -> None:
             if result.errors:
                 logger.warning("Social feed scrape warnings: %s", result.errors[:5])
             for tweet in result.tweets_to_post:
-                if social_feed_service.store.is_seen(tweet.tweet_id):
+                if social_feed_service.store.is_known_for_autopost(tweet.tweet_id):
                     continue
                 social_feed_service.mark_seen_unposted(tweet)
                 content, embeds = _build_social_feed_message(tweet)

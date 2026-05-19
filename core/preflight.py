@@ -14,7 +14,7 @@ back as a synthetic prior tool call — so Sarvam's first turn already
 has the data in hand and only has to write the Nepali summary.
 
 Deterministic preflight rules (match order matters):
-  1. Bare GitHub URL in message      → analyze_github_repo
+  1. GitHub URL anywhere in message  → analyze_github_repo
   2. Any other http(s) URL           → fetch_url
   3. Social feed / AI handles        → get_social_media_feed
   4. Minister role detected          → get_nepal_live_context(government, who_is)
@@ -113,15 +113,20 @@ def _is_political_news_request(text: str, lowered: str) -> bool:
     return False
 
 
-def _extract_first_url(text: str) -> str | None:
-    m = _URL_RE.search(text or "")
-    if not m:
-        return None
-    return m.group(0).rstrip(".,;:)")
+def _extract_urls(text: str) -> list[str]:
+    return [m.group(0).rstrip(".,;:)") for m in _URL_RE.finditer(text or "")]
 
 
 def _is_github_url(url: str) -> bool:
     return bool(_GITHUB_HOST_RE.match(url))
+
+
+def _is_direct_twitter_media_url(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"video.twimg.com", "pbs.twimg.com"}
 
 
 def _extract_ticker(text: str) -> str | None:
@@ -144,24 +149,31 @@ def plan_preflight(user_text: str | None) -> tuple[str, dict[str, Any]] | None:
         return None
     text = user_text.strip()
     lowered = text.lower()
+    social_feed_match = bool(_SOCIAL_FEED_RE.search(text) or _SOCIAL_FEED_DEV_RE.search(text))
 
-    # 1. URL in message — either GitHub or generic fetch.
-    url = _extract_first_url(text)
-    if url:
-        if _is_github_url(url):
-            return ("analyze_github_repo", {"repo": url})
-        return ("fetch_url", {"url": url})
+    # 1. URL in message — prefer a GitHub repo URL anywhere in the text.
+    # Users often paste screenshots/videos/log links first and the repo link
+    # later. In that shape, fetching the first media URL is the wrong action.
+    urls = _extract_urls(text)
+    if urls:
+        github_url = next((item for item in urls if _is_github_url(item)), None)
+        if github_url:
+            return ("analyze_github_repo", {"repo": github_url})
+        readable_urls = [item for item in urls if not _is_direct_twitter_media_url(item)]
+        if social_feed_match and not readable_urls:
+            return ("get_social_media_feed", {"limit": 10, "refresh": True})
+        return ("fetch_url", {"url": readable_urls[0] if readable_urls else urls[0]})
 
     # 1a. Explicit "web search" command — honour the user's direction.
     # "web search garnus", "google garera heru na", "online khoju".
     if _EXPLICIT_WEB_SEARCH_RE.search(lowered):
         return ("internet_search", {"query": _strip_command_tokens(text)})
 
-    # 1b. YetiDai's local #social-media feed state. This is not a live
-    # web search; it reads what the automatic background poster has
-    # already scraped and stored.
-    if _SOCIAL_FEED_RE.search(text) or _SOCIAL_FEED_DEV_RE.search(text):
-        return ("get_social_media_feed", {"limit": 10})
+    # 1b. YetiDai's social-media feed. Refresh so "latest/new/live"
+    # Twitter questions are not limited to whatever the background poster
+    # already cached.
+    if social_feed_match:
+        return ("get_social_media_feed", {"limit": 10, "refresh": True})
 
     # 2. Minister role → government + who_is. For "current / अहिले"
     #    identity queries, parallel-fire a web search because Wikipedia
