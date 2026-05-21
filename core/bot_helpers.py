@@ -81,6 +81,7 @@ def chunk_for_discord(text: str, limit: int = DISCORD_MSG_LIMIT) -> list[str]:
 
     Falls back to a hard slice only when no boundary exists inside the window
     (e.g. an unbroken URL or single long token).
+    Never emits empty string chunks — Discord rejects channel.send("") with 400.
     """
     chunks: list[str] = []
     remaining = text
@@ -93,7 +94,9 @@ def chunk_for_discord(text: str, limit: int = DISCORD_MSG_LIMIT) -> list[str]:
                 cut = ws
         if cut <= 0:
             cut = limit
-        chunks.append(remaining[:cut].rstrip())
+        chunk = remaining[:cut].rstrip()
+        if chunk:  # never append empty strings
+            chunks.append(chunk)
         remaining = remaining[cut:].lstrip()
     if remaining:
         chunks.append(remaining)
@@ -388,7 +391,7 @@ def build_correction_nudge(
     if requested_count:
         extra = (
             f"\nप्रयोगकर्ताले ठीक {requested_count} वटा माग्नुभएको छ। "
-            "यदि tool output मा {requested_count} वटा पर्याप्त छैनन् भने, "
+            f"यदि tool output मा {requested_count} वटा पर्याप्त छैनन् भने, "
             "दोहोरो प्रविष्टि (duplicate entries) कहिल्यै नलेख्नुहोस् — "
             "इमानदार भएर कति मात्र उपलब्ध छन् भन्नुहोस्।"
         )

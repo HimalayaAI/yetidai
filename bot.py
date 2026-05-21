@@ -152,47 +152,9 @@ logger.info(
 )
 
 with open("systemPrompt.txt", "r", encoding="utf-8") as f:
-    SYSTEM_PROMPT = f.read()
+    SYSTEM_PROMPT = f.read().strip()
 
-
-def _build_runtime_system_prompt() -> str:
-    """Return a compact prompt that fits small context-window backends.
-
-    The repository keeps the long canonical prompt in systemPrompt.txt for
-    reference, but low-context llama-server backends can reject a request
-    if we send that file verbatim. This runtime prompt preserves the core
-    routing and style rules while trimming examples and repeated guidance.
-    """
-    return (
-        "You are Yeti (यती), a warm, witty Nepali-language Discord assistant "
-        "built by Himalaya AI Research Lab (HARL).\n\n"
-        "Reply only in Nepali (Devanagari). Keep small talk short and human. "
-        "Use relaxed Nepali, not corporate chatbot language. Use ASCII digits "
-        "only inside URLs; otherwise convert digits to Devanagari in the final "
-        "answer.\n\n"
-        "Core rules: never guess current Nepal facts from memory; use tools for "
-        "anything that could have changed. Prefer NepalOSINT for Nepal facts. "
-        "Use internet_search for non-Nepal current events. Use fetch_url for a "
-        "specific pasted URL. For GitHub, never invent repo URLs; use "
-        "analyze_github_repo or list_github_repos. For the Discord social "
-        "feed, AI handles, or recent scraped tweets, use get_social_media_feed.\n\n"
-        "Routing: small talk needs no tool. Nepal factual questions use "
-        "get_nepal_live_context with the most specific intent "
-        "(macro, trading, debt, government, parliament, general_news, who_is, "
-        "history). Comparative Nepal/world questions may use multiple tool "
-        "calls in parallel.\n\n"
-        "Freshness: if NepalOSINT returns stale data, acknowledge it and use "
-        "web results as primary. Never pad counts with duplicates. If the user "
-        "corrects you, re-route instead of repeating the old answer.\n\n"
-        "Tool policy: never announce intent, never refuse a factual question "
-        "before calling a tool, and always cite tool-backed answers with a "
-        "short स्रोत: line containing real URLs or endpoint names.\n\n"
-        "Tone: warm, polite, sharp on facts. Short replies for small talk, "
-        "concise factual replies elsewhere."
-    )
-
-
-SYSTEM_PROMPT = _build_runtime_system_prompt()
+logger.info("Loaded system prompt from systemPrompt.txt (%d chars).", len(SYSTEM_PROMPT))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -348,25 +310,55 @@ async def _send_discord(channel, answer: str, citation_urls: list[str]) -> None:
 
     Body chunks and the citations embed are sent independently: a failure to
     build or send the embed must not prevent the body from being delivered.
+
+    The sources block is stripped from the body text when we have real URLs
+    to put in the embed — this prevents the same sources appearing twice
+    (once inline, once in the embed).
     """
     body, sources_line = split_body_and_sources(answer)
-    text = body if (citation_urls and body) else answer
+
+    # Deduplicate citation_urls before building the embed so the same URL
+    # never appears as two numbered fields.
+    seen_embed: set[str] = set()
+    unique_urls = [u for u in citation_urls if not (u in seen_embed or seen_embed.add(u))]
+
+    if unique_urls:
+        # We have real URLs → send the clean body (no inline sources block)
+        # and attach an embed. If body is empty for some reason, fall back
+        # to the full answer so the user always gets text.
+        text = body if body.strip() else answer
+    else:
+        # No URLs → send the full answer including any inline स्रोत: block.
+        text = answer
 
     for chunk in chunk_for_discord(text, DISCORD_MSG_LIMIT):
         await channel.send(chunk)
 
-    if not citation_urls:
+    if not unique_urls:
         return
 
     try:
         embed = discord.Embed(title="स्रोत / Sources", color=0x2D72D2)
-        for idx, url in enumerate(citation_urls[:5], start=1):
+        for idx, url in enumerate(unique_urls[:5], start=1):
             embed.add_field(name=f"{idx}.", value=safe_field_value(url), inline=False)
         if sources_line:
             embed.set_footer(text=sources_line[:DISCORD_EMBED_FOOTER_LIMIT])
         await channel.send(embed=embed)
     except Exception:
         logger.exception("Failed to send citations embed (body already delivered)")
+
+
+def _extend_citation_urls(citation_urls: list[str], new_urls: list[str]) -> None:
+    """Append URLs to citation_urls, skipping any already present.
+
+    citation_urls is accumulated across preflight, tool-loop, and fallback
+    paths — without this guard the same URL ends up as multiple embed fields.
+    """
+    existing = set(citation_urls)
+    for url in new_urls:
+        if url not in existing:
+            existing.add(url)
+            citation_urls.append(url)
 
 
 async def _execute_tool_call(
@@ -483,6 +475,24 @@ async def _execute_tool_call(
     return (tc.id, args, result, log_extra)
 
 
+
+# Stop sequences that tell the model "you are done".
+# - <|im_end|>  : ChatML end-of-turn token used by llama.cpp / llama-server
+#                 and most local GGUF backends.
+# - <|eot_id|>  : Llama-3 / Meta end-of-turn token.
+# - \n\nUser:   : Catches the model roleplaying the next user turn in plain
+#                 text (common repetition pattern on smaller models).
+# - \n\nHuman:  : Same pattern, Anthropic-style prompt format.
+# OpenAI's own hosted models ignore unknown stop strings gracefully, so
+# including all of them is safe across backends.
+_STOP_SEQUENCES: list[str] = [
+    "<|im_end|>",
+    "<|eot_id|>",
+    "\n\nUser:",
+    "\n\nHuman:",
+]
+
+
 async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
     """One OpenAI round-trip with timeout and one transient retry.
 
@@ -499,6 +509,7 @@ async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
                     tools=tools_array if tools_array else None,
                     tool_choice=tool_choice if tools_array else None,
                     temperature=0.2,
+                    stop=_STOP_SEQUENCES,
                 ),
                 timeout=TIME_OUT_SECONDS,
             )
@@ -535,13 +546,19 @@ async def on_message(message):
 
     await chad.call(message)
 
-    if not chad.user_input:
+    # Capture user_input immediately into a local variable so that
+    # concurrent on_message calls can't overwrite chad.user_input while
+    # this turn is still running.
+    user_input = chad.user_input
+    if not user_input:
         return
 
     # Fast path: greetings and chit-chat should never go through the full
     # tool loop. The backend here has a tiny context window, and sending a
     # simple hello through the LLM often produces refusal/apology noise.
-    if _is_smalltalk(chad.user_input):
+    # Only short messages with no question mark are treated as pure smalltalk;
+    # anything with "?" likely wants a real answer from the LLM.
+    if _is_smalltalk(user_input) and "?" not in user_input:
         try:
             await message.channel.send("ए हजुर 🙂 के छ?")
         except Exception:
@@ -569,7 +586,7 @@ async def on_message(message):
         # ── Build message list ────────────────────────────────────
         try:
             previous_messages = await chad.get_message_history(
-                message.channel, limit=2,
+                message.channel, limit=6,
             )
 
             today = datetime.date.today()
@@ -617,12 +634,12 @@ async def on_message(message):
             # a system message RIGHT BEFORE the current user turn so HimalayaGPT
             # reads them fresh without paying attention-decay on a long
             # history.
-            if looks_like_correction(chad.user_input):
-                requested_count = detect_requested_count(chad.user_input)
+            if looks_like_correction(user_input):
+                requested_count = detect_requested_count(user_input)
                 messages.append({
                     "role": "system",
                     "content": build_correction_nudge(
-                        chad.user_input,
+                        user_input,
                         requested_count=requested_count,
                     ),
                 })
@@ -632,7 +649,7 @@ async def on_message(message):
                     requested_count,
                 )
 
-            messages.append({"role": "user", "content": chad.user_input})
+            messages.append({"role": "user", "content": user_input})
             tools_array = registry.openai_tools()
 
             # ── Pre-flight tool execution ─────────────────────────
@@ -642,12 +659,12 @@ async def on_message(message):
             # HimalayaGPT's first turn then has the data in context and only
             # needs to write the Nepali summary — it literally cannot
             # emit "म खोज्छु" any more, because the work is done.
-            preflight = plan_preflight(chad.user_input)
+            preflight = plan_preflight(user_input)
             if preflight is not None:
                 pf_name, pf_args = preflight
                 pf_tc_id = f"preflight_{uuid.uuid4().hex[:8]}"
                 pf_ctx = ToolContext(
-                    query=chad.user_input,
+                    query=user_input,
                     history=previous_messages,
                     llm_client=llm_client,
                     channel_id=message.channel.id,
@@ -694,7 +711,7 @@ async def on_message(message):
                         tool_was_used = True
                         if pf_result.content:
                             tool_output_accum.append(pf_result.content)
-                    citation_urls.extend(extract_urls(pf_result.content))
+                    _extend_citation_urls(citation_urls, extract_urls(pf_result.content))
                     if pf_result.meta:
                         osint_endpoints_ok = pf_result.meta.get(
                             "endpoints_ok", osint_endpoints_ok,
@@ -744,7 +761,7 @@ async def on_message(message):
                                 tool_was_used = True
                                 if fb_result.content:
                                     tool_output_accum.append(fb_result.content)
-                            citation_urls.extend(extract_urls(fb_result.content))
+                            _extend_citation_urls(citation_urls, extract_urls(fb_result.content))
                             fallback_used = True
         except Exception:
             logger.exception("Failed building request context")
@@ -753,7 +770,7 @@ async def on_message(message):
                 turn_id=turn_id,
                 user_id=getattr(message.author, "id", None),
                 channel_id=getattr(message.channel, "id", None),
-                query=chad.user_input,
+                query=user_input,
                 tool_calls=tool_calls_log,
                 fallback_used=fallback_used,
                 osint_endpoints_ok=osint_endpoints_ok,
@@ -858,7 +875,7 @@ async def on_message(message):
                 })
 
                 ctx = ToolContext(
-                    query=chad.user_input,
+                    query=user_input,
                     history=previous_messages,
                     llm_client=llm_client,
                     channel_id=message.channel.id,
@@ -898,7 +915,7 @@ async def on_message(message):
                         tool_was_used = True
                         if result.content:
                             tool_output_accum.append(result.content)
-                    citation_urls.extend(extract_urls(result.content))
+                    _extend_citation_urls(citation_urls, extract_urls(result.content))
 
                     if result.meta:
                         osint_endpoints_ok = result.meta.get(
@@ -973,7 +990,7 @@ async def on_message(message):
                             tool_was_used = True
                             if fb_result.content:
                                 tool_output_accum.append(fb_result.content)
-                        citation_urls.extend(extract_urls(fb_result.content))
+                        _extend_citation_urls(citation_urls, extract_urls(fb_result.content))
                         fallback_used = True
                         logger.info(
                             "Auto-fallback %s → %s(args=%s) success=%s latency=%dms",
@@ -997,10 +1014,10 @@ async def on_message(message):
                 and (
                     (
                         is_empty_promise(ai_response, tool_was_used=tool_was_used)
-                        and needs_tool_use(chad.user_input)
+                        and needs_tool_use(user_input)
                     )
                     or news_answer_off_topic(
-                        chad.user_input, ai_response, tool_was_used=tool_was_used,
+                        user_input, ai_response, tool_was_used=tool_was_used,
                     )
                 )
             )
@@ -1012,7 +1029,7 @@ async def on_message(message):
                 messages.append({"role": "assistant", "content": ai_response})
                 messages.append({
                     "role": "system",
-                    "content": build_force_tool_nudge(chad.user_input),
+                    "content": build_force_tool_nudge(user_input),
                 })
                 # First attempt: tool_choice="required" — strongest hint
                 # we can give HimalayaGPT that it MUST emit a tool_call this
@@ -1050,7 +1067,7 @@ async def on_message(message):
                             ],
                         })
                         ctx_force = ToolContext(
-                            query=chad.user_input,
+                            query=user_input,
                             history=previous_messages,
                             llm_client=llm_client,
                             channel_id=message.channel.id,
@@ -1070,7 +1087,7 @@ async def on_message(message):
                                 tool_was_used = True
                                 if result.content:
                                     tool_output_accum.append(result.content)
-                            citation_urls.extend(extract_urls(result.content))
+                            _extend_citation_urls(citation_urls, extract_urls(result.content))
                             tool_calls_log.append({
                                 "name": next(
                                     (t.function.name for t in force_calls if t.id == tc_id),
@@ -1255,6 +1272,10 @@ async def on_message(message):
                             retry_content = ensure_sources_line(
                                 retry_content, citation_urls,
                             )
+                        # Apply markdown rewrite on the retry path too —
+                        # bare URLs in the स्रोत: block must be shortened
+                        # regardless of which code path produced the answer.
+                        retry_content = rewrite_sources_as_markdown(retry_content)
                         ai_response = retry_content
                         validator_retries = 1
                 elif pre_issues:
@@ -1285,7 +1306,7 @@ async def on_message(message):
             turn_id=turn_id,
             user_id=getattr(message.author, "id", None),
             channel_id=getattr(message.channel, "id", None),
-            query=chad.user_input,
+            query=user_input,
             tool_calls=tool_calls_log,
             fallback_used=fallback_used,
             osint_endpoints_ok=osint_endpoints_ok,
