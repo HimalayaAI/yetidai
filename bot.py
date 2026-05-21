@@ -212,12 +212,12 @@ logger.info(
     LLM_MODEL, TIME_OUT_SECONDS,
 )
 logger.info(
-    "Prompt profile=%s small_model=%s temp=%.2f max_tokens=%d history_limit=%d include_bot_history=%s validator_retry=%s",
+    "Prompt profile=%s small_model=%s temp=%.2f max_tokens=%d history_mode=%s include_bot_history=%s validator_retry=%s",
     PROMPT_PROFILE,
     IS_SMALL_PROFILE,
     LLM_TEMPERATURE,
     LLM_MAX_TOKENS,
-    HISTORY_LIMIT,
+    "none" if IS_SMALL_PROFILE else f"last_{HISTORY_LIMIT}",
     INCLUDE_BOT_HISTORY,
     ENABLE_VALIDATOR_RETRY,
 )
@@ -675,11 +675,16 @@ async def on_message(message):
 
         # ── Build message list ────────────────────────────────────
         try:
-            previous_messages = await chad.get_message_history(
-                message.channel,
-                limit=HISTORY_LIMIT,
-                include_bot_messages=INCLUDE_BOT_HISTORY,
-            )
+            # For yeti_small, use only the current user message to keep context
+            # pressure minimal and avoid history bleed on tiny models.
+            if IS_SMALL_PROFILE:
+                previous_messages = []
+            else:
+                previous_messages = await chad.get_message_history(
+                    message.channel,
+                    limit=HISTORY_LIMIT,
+                    include_bot_messages=INCLUDE_BOT_HISTORY,
+                )
 
             today = datetime.date.today()
             date_block = build_date_block(today)
