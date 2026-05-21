@@ -42,6 +42,8 @@ The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal
    YETI_SMALL_MAX_TOKENS=260
    YETI_SMALL_MODEL_NAME=himalaya-bf16
    YETI_ENABLE_VALIDATOR_RETRY=false
+   YETI_VALIDATOR_MAX_RETRIES=3
+   YETI_LEAK_RECOVERY_MAX_RETRIES=3
    YETI_SMALL_TOOLS=get_nepal_live_context,internet_search,fetch_url
    NEPALOSINT_BASE_URL=https://nepalosint.com/api/v1
    NEPALOSINT_PUBLIC_AUTH_ENABLED=true
@@ -56,6 +58,7 @@ If `YETI_PROMPT_PROFILE` is unset/blank, YetiDai now defaults to `yeti_small`.
 Set `YETI_PROMPT_PROFILE=auto` to pick `yeti_small` for tiny model names (like `0.5b/q8/bf16`) and `yeti_large` otherwise.
 When `yeti_small` is active, runtime defaults to `himalaya-bf16` (override with `YETI_SMALL_MODEL_NAME`).
 `YETI_ENABLE_VALIDATOR_RETRY` defaults to `false` on `yeti_small` to avoid small-model prompt-echo loops.
+`YETI_VALIDATOR_MAX_RETRIES` and `YETI_LEAK_RECOVERY_MAX_RETRIES` default to `3` on `yeti_small`.
 
 ### Automatic Social-Media Feed
 

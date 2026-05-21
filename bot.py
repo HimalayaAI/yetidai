@@ -188,6 +188,22 @@ ENABLE_VALIDATOR_RETRY = (
     .lower()
     in {"1", "true", "yes", "on"}
 )
+_default_validator_max_retries = "3" if IS_SMALL_PROFILE else "1"
+try:
+    VALIDATOR_MAX_RETRIES = max(
+        0,
+        int(os.getenv("YETI_VALIDATOR_MAX_RETRIES", _default_validator_max_retries)),
+    )
+except ValueError:
+    VALIDATOR_MAX_RETRIES = int(_default_validator_max_retries)
+_default_leak_recovery_retries = "3" if IS_SMALL_PROFILE else "1"
+try:
+    LEAK_RECOVERY_MAX_RETRIES = max(
+        0,
+        int(os.getenv("YETI_LEAK_RECOVERY_MAX_RETRIES", _default_leak_recovery_retries)),
+    )
+except ValueError:
+    LEAK_RECOVERY_MAX_RETRIES = int(_default_leak_recovery_retries)
 
 SMALL_TOOL_ALLOWLIST = frozenset(
     item.strip()
@@ -226,7 +242,7 @@ if IS_SMALL_PROFILE and LLM_MODEL != CONFIGURED_MODEL_NAME:
         LLM_MODEL,
     )
 logger.info(
-    "Prompt profile=%s small_model=%s temp=%.2f max_tokens=%d history_mode=%s include_bot_history=%s validator_retry=%s",
+    "Prompt profile=%s small_model=%s temp=%.2f max_tokens=%d history_mode=%s include_bot_history=%s validator_retry=%s validator_max_retries=%d leak_recovery_max_retries=%d",
     PROMPT_PROFILE,
     IS_SMALL_PROFILE,
     LLM_TEMPERATURE,
@@ -234,6 +250,8 @@ logger.info(
     "none" if IS_SMALL_PROFILE else f"last_{HISTORY_LIMIT}",
     INCLUDE_BOT_HISTORY,
     ENABLE_VALIDATOR_RETRY,
+    VALIDATOR_MAX_RETRIES,
+    LEAK_RECOVERY_MAX_RETRIES,
 )
 
 SYSTEM_PROMPT = build_runtime_system_prompt(PROMPT_PROFILE)
@@ -1391,24 +1409,27 @@ async def on_message(message):
                     github_tool_was_used=github_tool_was_used,
                 )
 
-                if post_issues and ENABLE_VALIDATOR_RETRY:
+                if post_issues and ENABLE_VALIDATOR_RETRY and VALIDATOR_MAX_RETRIES > 0:
                     logger.info(
                         "Validator issues remain after deterministic fixes "
-                        "(pre=%s post=%s) — retrying with LLM once.",
-                        pre_issues, post_issues,
+                        "(pre=%s post=%s) — retrying with LLM up to %d times.",
+                        pre_issues, post_issues, VALIDATOR_MAX_RETRIES,
                     )
-                    messages.append({"role": "assistant", "content": ai_response})
-                    messages.append({
-                        "role": "system",
-                        "content": build_fix_message(post_issues),
-                    })
-                    retry_resp = await _run_llm_turn(
-                        messages, tools_array=None, tool_choice=None,
-                    )
-                    retry_content = (
-                        retry_resp.choices[0].message.content or ""
-                    ) if retry_resp and getattr(retry_resp, "choices", None) else ""
-                    if retry_content:
+                    remaining_issues = list(post_issues)
+                    for attempt in range(1, VALIDATOR_MAX_RETRIES + 1):
+                        messages.append({"role": "assistant", "content": ai_response})
+                        messages.append({
+                            "role": "system",
+                            "content": build_fix_message(remaining_issues),
+                        })
+                        retry_resp = await _run_llm_turn(
+                            messages, tools_array=None, tool_choice=None,
+                        )
+                        retry_content = (
+                            retry_resp.choices[0].message.content or ""
+                        ) if retry_resp and getattr(retry_resp, "choices", None) else ""
+                        if not retry_content:
+                            continue
                         retry_content = normalize_digits(retry_content)
                         if tool_was_used:
                             retry_content = ensure_sources_line(
@@ -1419,7 +1440,25 @@ async def on_message(message):
                         # regardless of which code path produced the answer.
                         retry_content = rewrite_sources_as_markdown(retry_content)
                         ai_response = retry_content
-                        validator_retries = 1
+                        validator_retries += 1
+                        remaining_issues = validate_answer(
+                            ai_response,
+                            tool_was_used=tool_was_used,
+                            github_tool_was_used=github_tool_was_used,
+                        )
+                        if not remaining_issues:
+                            break
+                    if remaining_issues:
+                        logger.info(
+                            "Validator retries exhausted; issues remain: %s",
+                            remaining_issues,
+                        )
+                elif post_issues and ENABLE_VALIDATOR_RETRY:
+                    logger.info(
+                        "Validator retry enabled but VALIDATOR_MAX_RETRIES=0; skipping LLM retries "
+                        "(pre=%s post=%s).",
+                        pre_issues, post_issues,
+                    )
                 elif post_issues:
                     logger.info(
                         "Validator issues remain after deterministic fixes "
@@ -1436,18 +1475,57 @@ async def on_message(message):
                 logger.exception("Validator retry failed; keeping original answer")
 
         # Never surface validator instruction text to users; small models can
-        # sometimes echo internal fix prompts verbatim.
+        # sometimes echo internal fix prompts verbatim. Try multiple recovery
+        # rewrites before falling back to an apology.
         if ai_response and has_validator_instruction_leak(ai_response):
-            logger.warning(
-                "Validator instruction leak detected (turn=%s); replacing with safe fallback.",
-                turn_id,
-            )
-            ai_response = (
-                "माफ गर्नुहोस् हजुर — उत्तरको ढाँचा बिग्रियो। "
-                "कृपया यही प्रश्न फेरि सोध्नुहोस्।"
-            )
-            if tool_was_used:
-                ai_response = ensure_sources_line(ai_response, citation_urls)
+            recovered_from_leak = False
+            for attempt in range(1, LEAK_RECOVERY_MAX_RETRIES + 1):
+                try:
+                    leak_fix_messages = messages + [
+                        {"role": "assistant", "content": ai_response},
+                        {
+                            "role": "system",
+                            "content": (
+                                "अघिल्लो उत्तरमा आन्तरिक निर्देशन (validator text) आएको छ। "
+                                "अब केवल प्रयोगकर्तालाई दिने अन्तिम नेपाली उत्तर लेख्नुहोस्। "
+                                "'मुख्य जवाफ देवनागरी...' जस्ता निर्देशन वाक्य नलेख्नुहोस्।"
+                            ),
+                        },
+                    ]
+                    leak_resp = await _run_llm_turn(
+                        leak_fix_messages, tools_array=None, tool_choice=None,
+                    )
+                    leak_content = (
+                        leak_resp.choices[0].message.content or ""
+                    ) if leak_resp and getattr(leak_resp, "choices", None) else ""
+                    if not leak_content:
+                        continue
+                    leak_content = normalize_digits(leak_content)
+                    if tool_was_used:
+                        leak_content = ensure_sources_line(leak_content, citation_urls)
+                    leak_content = rewrite_sources_as_markdown(leak_content)
+                    ai_response = leak_content
+                    if not has_validator_instruction_leak(ai_response):
+                        recovered_from_leak = True
+                        break
+                except Exception:
+                    logger.exception(
+                        "Validator-leak recovery attempt %d failed (turn=%s)",
+                        attempt, turn_id,
+                    )
+
+            if not recovered_from_leak and has_validator_instruction_leak(ai_response):
+                logger.warning(
+                    "Validator instruction leak persisted after %d recovery attempts "
+                    "(turn=%s); replacing with safe fallback.",
+                    LEAK_RECOVERY_MAX_RETRIES, turn_id,
+                )
+                ai_response = (
+                    "माफ गर्नुहोस् हजुर — उत्तर तयार गर्दा ढाँचा बिग्रियो। "
+                    "कृपया यही प्रश्न फेरि सोध्नुहोस्।"
+                )
+                if tool_was_used:
+                    ai_response = ensure_sources_line(ai_response, citation_urls)
 
         # ── Send to Discord ──────────────────────────────────────
         try:
