@@ -14,6 +14,7 @@ from core.bot_helpers import (
     TOOL_TIMEOUT_MARKER,
     chunk_for_discord,
     classify_llm_error,
+    deduplicate_paragraphs,
     ensure_sources_line,
     extract_urls,
     hash_tool_call,
@@ -41,7 +42,7 @@ class BotHelpersTests(unittest.TestCase):
     def test_is_bot_apology_matches_openai_busy(self):
         self.assertTrue(
             is_bot_apology(
-                "माफ गर्नुहोस्, Sarvam अहिले व्यस्त छ। केही सेकेन्डपछि पुनः प्रयास गर्नुहोस्।"
+                "माफ गर्नुहोस्, HimalayaGPT अहिले व्यस्त छ। केही सेकेन्डपछि पुनः प्रयास गर्नुहोस्।"
             )
         )
 
@@ -141,6 +142,50 @@ class BotHelpersTests(unittest.TestCase):
         self.assertIn("GDP २% बढ्यो", out)
         self.assertIn("https://x.io/2025", out)
 
+    # ── deduplicate_paragraphs ──────────────────────────────────────
+
+    def test_deduplicate_paragraphs_drops_exact_duplicate_paragraphs(self):
+        p = "नेपाल-चीन सीमामा सगरमाथा पर्छ। यसको उचाइ ८,८४८.८६ मिटर हो।"
+        text = f"{p}\n\n{p}\n\n{p}"
+        out = deduplicate_paragraphs(text)
+        self.assertEqual(out, p)
+
+    def test_deduplicate_paragraphs_drops_duplicate_sentences(self):
+        text = (
+            "Mount Everest नेपाल-चीन सीमामा छ। "
+            "Mount Everest नेपाल-चीन सीमामा छ। "
+            "यसको उचाइ ८,८४८.८६ मिटर हो।"
+        )
+        out = deduplicate_paragraphs(text)
+        self.assertEqual(
+            out,
+            "Mount Everest नेपाल-चीन सीमामा छ। यसको उचाइ ८,८४८.८६ मिटर हो।",
+        )
+
+    def test_deduplicate_paragraphs_keeps_sources_block_intact(self):
+        p = "आजको मुख्य समाचार शीर्षकहरू यहाँ छन्।"
+        text = f"{p}\n\n{p}\n\nस्रोत:\n- https://example.com/news/1"
+        out = deduplicate_paragraphs(text)
+        self.assertIn("स्रोत:\n- https://example.com/news/1", out)
+        self.assertEqual(out.count("स्रोत:"), 1)
+        self.assertEqual(out.count("आजको मुख्य समाचार शीर्षकहरू यहाँ छन्।"), 1)
+
+    def test_deduplicate_paragraphs_near_duplicate_is_removed(self):
+        p1 = (
+            "Mount Everest, also known as Sagarmatha, lies on the Nepal-China border "
+            "in the Himalayan range and remains the world's highest peak."
+        )
+        p2 = (
+            "Mount Everest also known as Sagarmatha lies on the Nepal-China border "
+            "in the Himalayan range and remains the worlds highest peak."
+        )
+        out = deduplicate_paragraphs(f"{p1}\n\n{p2}")
+        self.assertEqual(out, p1)
+
+    def test_deduplicate_paragraphs_preserves_short_text(self):
+        short = "काठमाडौं नेपालको राजधानी हो।"
+        self.assertEqual(deduplicate_paragraphs(short), short)
+
     # ── ensure_sources_line ──────────────────────────────────────────
 
     def test_ensure_sources_line_noop_when_already_present(self):
@@ -208,7 +253,7 @@ class BotHelpersTests(unittest.TestCase):
 
     def test_classify_timeout_says_backend_slow(self):
         msg = classify_llm_error(asyncio.TimeoutError())
-        self.assertIn("Sarvam", msg)
+        self.assertIn("HimalayaGPT", msg)
         self.assertIn("ढिला", msg)
 
     def test_classify_429_says_busy(self):

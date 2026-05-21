@@ -16,6 +16,7 @@ Groups:
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import hashlib
 import json
 import re
@@ -207,6 +208,94 @@ def normalize_digits(text: str) -> str:
         last = m.end()
     out.append(text[last:].translate(_ASCII_TO_DEVANAGARI))
     return "".join(out)
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[।.!?])\s+")
+_WHITESPACE_RE = re.compile(r"\s+")
+_TRIM_PUNCT_RE = re.compile(r"^[\s'\"`“”‘’.,;:!?।-]+|[\s'\"`“”‘’.,;:!?।-]+$")
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Canonical key for sentence/paragraph dedup (case + whitespace + edge punctuation)."""
+    if not text:
+        return ""
+    lowered = text.casefold()
+    lowered = _TRIM_PUNCT_RE.sub("", lowered)
+    lowered = _WHITESPACE_RE.sub(" ", lowered)
+    return lowered.strip()
+
+
+def _is_near_duplicate(candidate: str, previous: list[str], *, threshold: float = 0.94) -> bool:
+    """True if candidate is extremely similar to any recently kept paragraph."""
+    if len(candidate) < 80:
+        return False
+    for prior in previous[-3:]:
+        if len(prior) < 80:
+            continue
+        if SequenceMatcher(None, candidate, prior).ratio() >= threshold:
+            return True
+    return False
+
+
+def deduplicate_paragraphs(text: str) -> str:
+    """Strip repeated paragraphs/sentences while preserving the trailing स्रोत: block.
+
+    Small models sometimes enter a loop and emit the same paragraph with tiny
+    edits multiple times. This helper removes exact duplicates plus close
+    near-duplicates and also drops repeated sentences inside paragraphs.
+    """
+    if not text:
+        return text
+
+    body, sources = split_body_and_sources(text)
+    body = body.rstrip()
+    if len(body) < 40:
+        return text.rstrip()
+
+    raw_paras = [p.strip() for p in re.split(r"\n{2,}", body) if p and p.strip()]
+    if not raw_paras:
+        return text.rstrip()
+
+    kept_paras: list[str] = []
+    kept_para_keys: list[str] = []
+    seen_para_keys: set[str] = set()
+    seen_sentence_keys: set[str] = set()
+
+    for para in raw_paras:
+        para_for_key = para
+        if not re.search(r"^\s*[-*•]\s+", para, flags=re.M):
+            sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(para) if s and s.strip()]
+            if len(sentences) > 1:
+                unique_sentences: list[str] = []
+                for sent in sentences:
+                    sent_key = _normalize_for_dedup(sent)
+                    if not sent_key:
+                        continue
+                    if sent_key in seen_sentence_keys:
+                        continue
+                    seen_sentence_keys.add(sent_key)
+                    unique_sentences.append(sent)
+                if unique_sentences:
+                    para_for_key = " ".join(unique_sentences)
+
+        para_key = _normalize_for_dedup(para_for_key)
+        if not para_key:
+            continue
+        if para_key in seen_para_keys:
+            continue
+        if _is_near_duplicate(para_key, kept_para_keys):
+            continue
+        seen_para_keys.add(para_key)
+        kept_para_keys.append(para_key)
+        kept_paras.append(para_for_key)
+
+    if not kept_paras:
+        return text.rstrip()
+
+    deduped_body = "\n\n".join(kept_paras).strip()
+    if not sources:
+        return deduped_body
+    return f"{deduped_body}\n\n{sources}".rstrip()
 
 
 # ── Tool-loop plumbing ────────────────────────────────────────────

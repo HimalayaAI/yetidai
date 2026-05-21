@@ -88,6 +88,7 @@ from core.bot_helpers import (
     detect_fabricated_source_names,
     detect_fabricated_urls,
     detect_requested_count,
+    deduplicate_paragraphs,
     ensure_sources_line,
     extract_urls,
     hash_tool_call,
@@ -1394,6 +1395,7 @@ async def on_message(message):
 
                 # Mechanical fixes first — cheap, don't need the LLM.
                 ai_response = normalize_digits(ai_response)
+                ai_response = deduplicate_paragraphs(ai_response)
                 if tool_was_used:
                     ai_response = ensure_sources_line(ai_response, citation_urls)
                 # Shorten any bare URLs in the स्रोत: block to Discord-markdown
@@ -1431,6 +1433,7 @@ async def on_message(message):
                         if not retry_content:
                             continue
                         retry_content = normalize_digits(retry_content)
+                        retry_content = deduplicate_paragraphs(retry_content)
                         if tool_was_used:
                             retry_content = ensure_sources_line(
                                 retry_content, citation_urls,
@@ -1501,6 +1504,7 @@ async def on_message(message):
                     if not leak_content:
                         continue
                     leak_content = normalize_digits(leak_content)
+                    leak_content = deduplicate_paragraphs(leak_content)
                     if tool_was_used:
                         leak_content = ensure_sources_line(leak_content, citation_urls)
                     leak_content = rewrite_sources_as_markdown(leak_content)
