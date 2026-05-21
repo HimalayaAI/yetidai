@@ -4,6 +4,7 @@ from __future__ import annotations
 
 SMALL_PROFILE_NAME = "yeti_small"
 LARGE_PROFILE_NAME = "yeti_large"
+DEFAULT_SMALL_MODEL_NAME = "himalaya-bf16"
 DEFAULT_SMALL_TOOL_ALLOWLIST = (
     "get_nepal_live_context,internet_search,fetch_url"
 )
@@ -35,6 +36,19 @@ def resolve_prompt_profile(explicit_profile: str | None, model_name: str | None)
     if raw in {"large", LARGE_PROFILE_NAME}:
         return LARGE_PROFILE_NAME
     return SMALL_PROFILE_NAME if is_small_model_name(model_name) else LARGE_PROFILE_NAME
+
+
+def resolve_runtime_model(
+    profile: str,
+    configured_model: str | None,
+    small_model_name: str | None = None,
+) -> str:
+    """Return runtime model name, forcing a stable small-model backend."""
+    configured = (configured_model or "").strip()
+    if profile == SMALL_PROFILE_NAME:
+        forced = (small_model_name or DEFAULT_SMALL_MODEL_NAME).strip()
+        return forced or DEFAULT_SMALL_MODEL_NAME
+    return configured or "gpt-4.1-mini"
 
 
 def build_small_runtime_prompt() -> str:

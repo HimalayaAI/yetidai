@@ -64,11 +64,13 @@ from core.nepali_date import format_bs_ne, format_bs_iso
 from core.date_context import build_date_block
 from core.preflight import plan_preflight
 from core.prompt_profiles import (
+    DEFAULT_SMALL_MODEL_NAME,
     DEFAULT_SMALL_TOOL_ALLOWLIST,
     SMALL_PROFILE_NAME,
     build_runtime_system_prompt,
     parse_stop_tokens,
     resolve_prompt_profile,
+    resolve_runtime_model,
 )
 from core.bot_helpers import (
     DISCORD_EMBED_FOOTER_LIMIT,
@@ -89,6 +91,7 @@ from core.bot_helpers import (
     ensure_sources_line,
     extract_urls,
     hash_tool_call,
+    has_validator_instruction_leak,
     is_bot_apology,
     is_empty_promise,
     is_real_tool_content,
@@ -133,7 +136,7 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY")
 BASE_URL = os.getenv("BASE_URL") or os.getenv("OPENAI_BASE_URL")
-LLM_MODEL = (
+CONFIGURED_MODEL_NAME = (
     os.getenv("MODEL_NAME")
     or os.getenv("OPENAI_MODEL_NAME")
     or os.getenv("OPENAI_MODEL")
@@ -148,8 +151,13 @@ _profile_env = os.getenv("YETI_PROMPT_PROFILE")
 if _profile_env is None or not _profile_env.strip():
     # Temporary product default: run in small profile unless explicitly overridden.
     _profile_env = SMALL_PROFILE_NAME
-PROMPT_PROFILE = resolve_prompt_profile(_profile_env, LLM_MODEL)
+PROMPT_PROFILE = resolve_prompt_profile(_profile_env, CONFIGURED_MODEL_NAME)
 IS_SMALL_PROFILE = PROMPT_PROFILE == SMALL_PROFILE_NAME
+LLM_MODEL = resolve_runtime_model(
+    PROMPT_PROFILE,
+    CONFIGURED_MODEL_NAME,
+    os.getenv("YETI_SMALL_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME),
+)
 LLM_TEMPERATURE = float(
     os.getenv("YETI_SMALL_TEMPERATURE", "0")
     if IS_SMALL_PROFILE
@@ -211,6 +219,12 @@ logger.info(
     BASE_URL or "default",
     LLM_MODEL, TIME_OUT_SECONDS,
 )
+if IS_SMALL_PROFILE and LLM_MODEL != CONFIGURED_MODEL_NAME:
+    logger.info(
+        "Small profile forcing model override: configured=%s runtime=%s",
+        CONFIGURED_MODEL_NAME,
+        LLM_MODEL,
+    )
 logger.info(
     "Prompt profile=%s small_model=%s temp=%.2f max_tokens=%d history_mode=%s include_bot_history=%s validator_retry=%s",
     PROMPT_PROFILE,
@@ -1420,6 +1434,20 @@ async def on_message(message):
                     )
             except Exception:
                 logger.exception("Validator retry failed; keeping original answer")
+
+        # Never surface validator instruction text to users; small models can
+        # sometimes echo internal fix prompts verbatim.
+        if ai_response and has_validator_instruction_leak(ai_response):
+            logger.warning(
+                "Validator instruction leak detected (turn=%s); replacing with safe fallback.",
+                turn_id,
+            )
+            ai_response = (
+                "माफ गर्नुहोस् हजुर — उत्तरको ढाँचा बिग्रियो। "
+                "कृपया यही प्रश्न फेरि सोध्नुहोस्।"
+            )
+            if tool_was_used:
+                ai_response = ensure_sources_line(ai_response, citation_urls)
 
         # ── Send to Discord ──────────────────────────────────────
         try:

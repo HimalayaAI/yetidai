@@ -17,6 +17,7 @@ from core.bot_helpers import (
     ensure_sources_line,
     extract_urls,
     hash_tool_call,
+    has_validator_instruction_leak,
     is_bot_apology,
     is_real_tool_content,
     is_transient_llm_error,
@@ -53,6 +54,13 @@ class BotHelpersTests(unittest.TestCase):
     def test_is_bot_apology_tolerates_leading_whitespace(self):
         # Discord sometimes preserves leading whitespace in quoted replies.
         self.assertTrue(is_bot_apology("   " + GENERIC_TECH_ERROR))
+
+    def test_has_validator_instruction_leak_detects_internal_fix_text(self):
+        leaked = "मुख्य जवाफ देवनागरी (नेपाली) मा लेखिएको छैन — पुनः नेपालीमा लेख्नुहोस्।"
+        self.assertTrue(has_validator_instruction_leak(leaked))
+
+    def test_has_validator_instruction_leak_rejects_normal_answer(self):
+        self.assertFalse(has_validator_instruction_leak("नेपालको राजधानी काठमाडौं हो।"))
 
     # ── safe_field_value (Discord 1024-char embed cap) ───────────────
 

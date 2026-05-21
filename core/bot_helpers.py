@@ -37,6 +37,14 @@ BOT_APOLOGY_PREFIXES: tuple[str, ...] = (
     "माफ गर्नुहोस्, नेटवर्क",
 )
 
+# Fragments from internal validator/fix prompts that should never be surfaced
+# directly to Discord users.
+_VALIDATOR_LEAK_MARKERS: tuple[str, ...] = (
+    "मुख्य जवाफ देवनागरी",
+    "उही तथ्य-सूचनालाई",
+    "कृपया तुरुन्त पुनः लेख्नुहोस्",
+)
+
 URL_RE = re.compile(r"https?://[^\s)\]\"<>]+")
 
 # Translation table for ASCII → Devanagari digits.
@@ -52,6 +60,14 @@ def is_bot_apology(content: str) -> bool:
         return False
     stripped = content.lstrip()
     return any(stripped.startswith(p) for p in BOT_APOLOGY_PREFIXES)
+
+
+def has_validator_instruction_leak(content: str | None) -> bool:
+    """True when output appears to be validator/fix instruction text."""
+    if not content:
+        return False
+    normalized = " ".join(content.split())
+    return any(marker in normalized for marker in _VALIDATOR_LEAK_MARKERS)
 
 
 def extract_urls(text: str | None) -> list[str]:

@@ -5,12 +5,14 @@ from __future__ import annotations
 import unittest
 
 from core.prompt_profiles import (
+    DEFAULT_SMALL_MODEL_NAME,
     LARGE_PROFILE_NAME,
     SMALL_PROFILE_NAME,
     build_runtime_system_prompt,
     build_small_runtime_prompt,
     parse_stop_tokens,
     resolve_prompt_profile,
+    resolve_runtime_model,
 )
 
 
@@ -51,6 +53,20 @@ class StopTokenParserTests(unittest.TestCase):
     def test_parse_stop_tokens_none(self) -> None:
         self.assertIsNone(parse_stop_tokens(""))
         self.assertIsNone(parse_stop_tokens(None))
+
+
+class RuntimeModelResolutionTests(unittest.TestCase):
+    def test_small_profile_forces_small_model_default(self) -> None:
+        model = resolve_runtime_model(SMALL_PROFILE_NAME, "himalaya-q8")
+        self.assertEqual(model, DEFAULT_SMALL_MODEL_NAME)
+
+    def test_small_profile_allows_explicit_small_override(self) -> None:
+        model = resolve_runtime_model(SMALL_PROFILE_NAME, "himalaya-q8", "himalaya-custom")
+        self.assertEqual(model, "himalaya-custom")
+
+    def test_large_profile_keeps_configured_model(self) -> None:
+        model = resolve_runtime_model(LARGE_PROFILE_NAME, "gpt-4.1-mini")
+        self.assertEqual(model, "gpt-4.1-mini")
 
 
 if __name__ == "__main__":
