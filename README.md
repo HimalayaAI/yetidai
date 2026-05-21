@@ -37,6 +37,11 @@ The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal
    BASE_URL=https://api.openai.com/v1
    MODEL_NAME=gpt-4.1-mini
    TIME_OUT_SECONDS=25
+   YETI_PROMPT_PROFILE=
+   YETI_SMALL_TEMPERATURE=0
+   YETI_SMALL_MAX_TOKENS=260
+   YETI_ENABLE_VALIDATOR_RETRY=false
+   YETI_SMALL_TOOLS=get_nepal_live_context,internet_search,fetch_url
    NEPALOSINT_BASE_URL=https://nepalosint.com/api/v1
    NEPALOSINT_PUBLIC_AUTH_ENABLED=true
    NEPALOSINT_TIMEOUT_SECONDS=8
@@ -45,7 +50,10 @@ The LLM is provided with declarative JSON-Schema specs for tools like `get_nepal
    YETI_SOCIAL_CHANNEL_NAME=social-media
    ```
 
-*(Note: `NEPALOSINT_*` variables are optional and default to the public API).*
+*(Note: `NEPALOSINT_*` variables are optional and default to the public API.)*
+If `YETI_PROMPT_PROFILE` is unset/blank, YetiDai now defaults to `yeti_small`.
+Set `YETI_PROMPT_PROFILE=auto` to pick `yeti_small` for tiny model names (like `0.5b/q8/bf16`) and `yeti_large` otherwise.
+`YETI_ENABLE_VALIDATOR_RETRY` defaults to `false` on `yeti_small` to avoid small-model prompt-echo loops.
 
 ### Automatic Social-Media Feed
 

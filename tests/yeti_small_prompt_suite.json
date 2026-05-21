@@ -1,0 +1,34 @@
+[
+  {
+    "id": "capital_nepal_en",
+    "prompt": "What is the capital city of Nepal?"
+  },
+  {
+    "id": "capital_india_en",
+    "prompt": "What is the capital city of India?"
+  },
+  {
+    "id": "define_cell_en",
+    "prompt": "Define cell."
+  },
+  {
+    "id": "temple_run_en",
+    "prompt": "Tell me about Temple Run."
+  },
+  {
+    "id": "nepal_today_news_ne",
+    "prompt": "नेपालमा आज मुख्य समाचार के छ?"
+  },
+  {
+    "id": "macro_update_ne",
+    "prompt": "नेपालको मुद्रास्फीति र रेमिट्यान्सको पछिल्लो अपडेट देऊ।"
+  },
+  {
+    "id": "kathmandu_mayor_ne",
+    "prompt": "काठमाडौं महानगरको मेयर को हुन्?"
+  },
+  {
+    "id": "nepal_india_compare_ne",
+    "prompt": "नेपाल र भारतको आजको प्रमुख आर्थिक समाचार तुलना गर।"
+  }
+]

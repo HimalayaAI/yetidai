@@ -63,6 +63,13 @@ from core.request_log import log_turn
 from core.nepali_date import format_bs_ne, format_bs_iso
 from core.date_context import build_date_block
 from core.preflight import plan_preflight
+from core.prompt_profiles import (
+    DEFAULT_SMALL_TOOL_ALLOWLIST,
+    SMALL_PROFILE_NAME,
+    build_runtime_system_prompt,
+    parse_stop_tokens,
+    resolve_prompt_profile,
+)
 from core.bot_helpers import (
     DISCORD_EMBED_FOOTER_LIMIT,
     DISCORD_MSG_LIMIT,
@@ -137,6 +144,60 @@ TIME_OUT_SECONDS = float(
     or os.getenv("OPENAI_TIMEOUT_SECONDS")
     or "25"
 )
+_profile_env = os.getenv("YETI_PROMPT_PROFILE")
+if _profile_env is None or not _profile_env.strip():
+    # Temporary product default: run in small profile unless explicitly overridden.
+    _profile_env = SMALL_PROFILE_NAME
+PROMPT_PROFILE = resolve_prompt_profile(_profile_env, LLM_MODEL)
+IS_SMALL_PROFILE = PROMPT_PROFILE == SMALL_PROFILE_NAME
+LLM_TEMPERATURE = float(
+    os.getenv("YETI_SMALL_TEMPERATURE", "0")
+    if IS_SMALL_PROFILE
+    else os.getenv("YETI_LARGE_TEMPERATURE", "0.2")
+)
+LLM_MAX_TOKENS = int(
+    os.getenv("YETI_SMALL_MAX_TOKENS", "260")
+    if IS_SMALL_PROFILE
+    else os.getenv("YETI_LARGE_MAX_TOKENS", "480")
+)
+LLM_STOP_TOKENS = parse_stop_tokens(os.getenv("YETI_STOP_TOKENS"))
+HISTORY_LIMIT = int(
+    os.getenv("YETI_SMALL_HISTORY_LIMIT", "1")
+    if IS_SMALL_PROFILE
+    else os.getenv("YETI_LARGE_HISTORY_LIMIT", "2")
+)
+_default_include_bot_history = "false" if IS_SMALL_PROFILE else "true"
+INCLUDE_BOT_HISTORY = (
+    os.getenv("YETI_INCLUDE_BOT_HISTORY", _default_include_bot_history)
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+_default_validator_retry = "false" if IS_SMALL_PROFILE else "true"
+ENABLE_VALIDATOR_RETRY = (
+    os.getenv("YETI_ENABLE_VALIDATOR_RETRY", _default_validator_retry)
+    .strip()
+    .lower()
+    in {"1", "true", "yes", "on"}
+)
+
+SMALL_TOOL_ALLOWLIST = frozenset(
+    item.strip()
+    for item in (
+        os.getenv("YETI_SMALL_TOOLS", DEFAULT_SMALL_TOOL_ALLOWLIST).split(",")
+    )
+    if item.strip()
+)
+if IS_SMALL_PROFILE and not SMALL_TOOL_ALLOWLIST:
+    SMALL_TOOL_ALLOWLIST = frozenset(
+        item.strip()
+        for item in DEFAULT_SMALL_TOOL_ALLOWLIST.split(",")
+        if item.strip()
+    )
+    logger.warning(
+        "YETI_SMALL_TOOLS resolved empty; falling back to default allowlist=%s",
+        sorted(SMALL_TOOL_ALLOWLIST),
+    )
 
 if not API_KEY:
     raise RuntimeError(
@@ -150,11 +211,18 @@ logger.info(
     BASE_URL or "default",
     LLM_MODEL, TIME_OUT_SECONDS,
 )
+logger.info(
+    "Prompt profile=%s small_model=%s temp=%.2f max_tokens=%d history_limit=%d include_bot_history=%s validator_retry=%s",
+    PROMPT_PROFILE,
+    IS_SMALL_PROFILE,
+    LLM_TEMPERATURE,
+    LLM_MAX_TOKENS,
+    HISTORY_LIMIT,
+    INCLUDE_BOT_HISTORY,
+    ENABLE_VALIDATOR_RETRY,
+)
 
-with open("systemPrompt.txt", "r", encoding="utf-8") as f:
-    SYSTEM_PROMPT = f.read().strip()
-
-logger.info("Loaded system prompt from systemPrompt.txt (%d chars).", len(SYSTEM_PROMPT))
+SYSTEM_PROMPT = build_runtime_system_prompt(PROMPT_PROFILE)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -172,6 +240,18 @@ MAX_TOOL_ROUNDS = 5
 # Per-tool wall-clock limit. Tools can override via ToolSpec.timeout_seconds
 # (slow aggregators) or be pinned lower for fast local lookups.
 YETI_TOOL_TIMEOUT = float(os.getenv("YETI_TOOL_TIMEOUT", "15"))
+
+
+def _select_tools_array() -> list[dict]:
+    """Return tool schemas for the current profile."""
+    all_tools = registry.openai_tools()
+    if not IS_SMALL_PROFILE:
+        return all_tools
+    return [
+        tool
+        for tool in all_tools
+        if (tool.get("function", {}) or {}).get("name") in SMALL_TOOL_ALLOWLIST
+    ]
 
 
 def _normalize_channel_name(name: str) -> str:
@@ -502,15 +582,20 @@ async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
     last_exc: BaseException | None = None
     for attempt in range(2):
         try:
+            request_payload = {
+                "model": LLM_MODEL,
+                "messages": messages,
+                "tools": tools_array if tools_array else None,
+                "tool_choice": tool_choice if tools_array else None,
+                "temperature": LLM_TEMPERATURE,
+                "max_tokens": LLM_MAX_TOKENS,
+            }
+            if LLM_STOP_TOKENS:
+                request_payload["stop"] = LLM_STOP_TOKENS
+            else:
+                request_payload["stop"] = _STOP_SEQUENCES
             return await asyncio.wait_for(
-                llm_client.chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=messages,
-                    tools=tools_array if tools_array else None,
-                    tool_choice=tool_choice if tools_array else None,
-                    temperature=0.2,
-                    stop=_STOP_SEQUENCES,
-                ),
+                llm_client.chat.completions.create(**request_payload),
                 timeout=TIME_OUT_SECONDS,
             )
         except asyncio.TimeoutError as exc:
@@ -533,8 +618,13 @@ async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
 async def on_ready():
     global social_feed_task
     tool_names = [t.name for t in registry.list_tools()]
+    active_tool_names = [
+        (tool.get("function", {}) or {}).get("name")
+        for tool in _select_tools_array()
+    ]
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id)
     logger.info("Registered tools: %s", tool_names)
+    logger.info("Active tools for profile %s: %s", PROMPT_PROFILE, active_tool_names)
     if social_feed_config.enabled and social_feed_task is None:
         social_feed_task = asyncio.create_task(_run_social_feed())
 
@@ -586,7 +676,9 @@ async def on_message(message):
         # ── Build message list ────────────────────────────────────
         try:
             previous_messages = await chad.get_message_history(
-                message.channel, limit=6,
+                message.channel,
+                limit=HISTORY_LIMIT,
+                include_bot_messages=INCLUDE_BOT_HISTORY,
             )
 
             today = datetime.date.today()
@@ -650,7 +742,12 @@ async def on_message(message):
                 )
 
             messages.append({"role": "user", "content": user_input})
-            tools_array = registry.openai_tools()
+            tools_array = _select_tools_array()
+            allowed_tool_names = {
+                (tool.get("function", {}) or {}).get("name")
+                for tool in tools_array
+                if (tool.get("function", {}) or {}).get("name")
+            }
 
             # ── Pre-flight tool execution ─────────────────────────
             # Deterministic rule-based classifier decides if the query
@@ -662,107 +759,124 @@ async def on_message(message):
             preflight = plan_preflight(user_input)
             if preflight is not None:
                 pf_name, pf_args = preflight
-                pf_tc_id = f"preflight_{uuid.uuid4().hex[:8]}"
-                pf_ctx = ToolContext(
-                    query=user_input,
-                    history=previous_messages,
-                    llm_client=llm_client,
-                    channel_id=message.channel.id,
-                    user_id=message.author.id,
-                )
-                logger.info(
-                    "Preflight (turn=%s): %s(%s)", turn_id, pf_name, pf_args,
-                )
-                try:
-                    pf_result = await asyncio.wait_for(
-                        registry.execute(pf_name, pf_ctx, pf_args),
-                        timeout=YETI_TOOL_TIMEOUT,
+                if pf_name not in allowed_tool_names:
+                    logger.info(
+                        "Preflight skipped for profile %s: tool=%s not in active allowlist.",
+                        PROMPT_PROFILE,
+                        pf_name,
                     )
-                except Exception as exc:
-                    logger.exception("Preflight failed: %s", exc)
-                    pf_result = None
-
-                if pf_result is not None:
-                    # Append the synthetic tool_call + tool result as if
-                    # HimalayaGPT had already chosen this tool. HimalayaGPT's next
-                    # turn sees a completed interaction and continues.
-                    messages.append({
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": pf_tc_id,
-                            "type": "function",
-                            "function": {
-                                "name": pf_name,
-                                "arguments": json.dumps(
-                                    pf_args, ensure_ascii=False,
-                                ),
-                            },
-                        }],
-                    })
-                    messages.append(pf_result.to_tool_message(pf_tc_id))
-                    tool_calls_log.append({
-                        "name": pf_name,
-                        "args": pf_args,
-                        "success": pf_result.success,
-                        "preflight": True,
-                    })
-                    if is_real_tool_content(pf_result):
-                        tool_was_used = True
-                        if pf_result.content:
-                            tool_output_accum.append(pf_result.content)
-                    _extend_citation_urls(citation_urls, extract_urls(pf_result.content))
-                    if pf_result.meta:
-                        osint_endpoints_ok = pf_result.meta.get(
-                            "endpoints_ok", osint_endpoints_ok,
+                    preflight = None
+                else:
+                    pf_tc_id = f"preflight_{uuid.uuid4().hex[:8]}"
+                    pf_ctx = ToolContext(
+                        query=user_input,
+                        history=previous_messages,
+                        llm_client=llm_client,
+                        channel_id=message.channel.id,
+                        user_id=message.author.id,
+                    )
+                    logger.info(
+                        "Preflight (turn=%s): %s(%s)", turn_id, pf_name, pf_args,
+                    )
+                    try:
+                        pf_result = await asyncio.wait_for(
+                            registry.execute(pf_name, pf_ctx, pf_args),
+                            timeout=YETI_TOOL_TIMEOUT,
                         )
-                        osint_endpoints_failed = pf_result.meta.get(
-                            "endpoints_failed", osint_endpoints_failed,
-                        )
+                    except Exception as exc:
+                        logger.exception("Preflight failed: %s", exc)
+                        pf_result = None
 
-                    # If the preflight triggered a fallback (e.g. OSINT
-                    # returned empty → internet_search), execute the
-                    # fallback too so HimalayaGPT has that data as well.
-                    if pf_result.trigger_fallback and pf_result.fallback_tool:
-                        fb_tc_id = f"preflight_fb_{uuid.uuid4().hex[:8]}"
-                        fb_args = pf_result.fallback_args or {}
-                        try:
-                            fb_result = await asyncio.wait_for(
-                                registry.execute(
-                                    pf_result.fallback_tool, pf_ctx, fb_args,
-                                ),
-                                timeout=YETI_TOOL_TIMEOUT,
+                    if pf_result is not None:
+                        # Append the synthetic tool_call + tool result as if
+                        # HimalayaGPT had already chosen this tool. HimalayaGPT's next
+                        # turn sees a completed interaction and continues.
+                        messages.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": pf_tc_id,
+                                "type": "function",
+                                "function": {
+                                    "name": pf_name,
+                                    "arguments": json.dumps(
+                                        pf_args, ensure_ascii=False,
+                                    ),
+                                },
+                            }],
+                        })
+                        messages.append(pf_result.to_tool_message(pf_tc_id))
+                        tool_calls_log.append({
+                            "name": pf_name,
+                            "args": pf_args,
+                            "success": pf_result.success,
+                            "preflight": True,
+                        })
+                        if is_real_tool_content(pf_result):
+                            tool_was_used = True
+                            if pf_result.content:
+                                tool_output_accum.append(pf_result.content)
+                        _extend_citation_urls(citation_urls, extract_urls(pf_result.content))
+                        if pf_result.meta:
+                            osint_endpoints_ok = pf_result.meta.get(
+                                "endpoints_ok", osint_endpoints_ok,
                             )
-                        except Exception:
-                            fb_result = None
-                        if fb_result is not None:
-                            messages.append({
-                                "role": "assistant",
-                                "content": "",
-                                "tool_calls": [{
-                                    "id": fb_tc_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": pf_result.fallback_tool,
-                                        "arguments": json.dumps(
-                                            fb_args, ensure_ascii=False,
-                                        ),
-                                    },
-                                }],
-                            })
-                            messages.append(fb_result.to_tool_message(fb_tc_id))
-                            tool_calls_log.append({
-                                "name": pf_result.fallback_tool,
-                                "args": fb_args,
-                                "success": fb_result.success,
-                                "preflight_fallback": True,
-                            })
-                            if is_real_tool_content(fb_result):
-                                tool_was_used = True
-                                if fb_result.content:
-                                    tool_output_accum.append(fb_result.content)
-                            _extend_citation_urls(citation_urls, extract_urls(fb_result.content))
-                            fallback_used = True
+                            osint_endpoints_failed = pf_result.meta.get(
+                                "endpoints_failed", osint_endpoints_failed,
+                            )
+
+                        # If the preflight triggered a fallback (e.g. OSINT
+                        # returned empty → internet_search), execute the
+                        # fallback too so HimalayaGPT has that data as well.
+                        if (
+                            pf_result.trigger_fallback
+                            and pf_result.fallback_tool
+                            and pf_result.fallback_tool in allowed_tool_names
+                        ):
+                            fb_tc_id = f"preflight_fb_{uuid.uuid4().hex[:8]}"
+                            fb_args = pf_result.fallback_args or {}
+                            try:
+                                fb_result = await asyncio.wait_for(
+                                    registry.execute(
+                                        pf_result.fallback_tool, pf_ctx, fb_args,
+                                    ),
+                                    timeout=YETI_TOOL_TIMEOUT,
+                                )
+                            except Exception:
+                                fb_result = None
+                            if fb_result is not None:
+                                messages.append({
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [{
+                                        "id": fb_tc_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": pf_result.fallback_tool,
+                                            "arguments": json.dumps(
+                                                fb_args, ensure_ascii=False,
+                                            ),
+                                        },
+                                    }],
+                                })
+                                messages.append(fb_result.to_tool_message(fb_tc_id))
+                                tool_calls_log.append({
+                                    "name": pf_result.fallback_tool,
+                                    "args": fb_args,
+                                    "success": fb_result.success,
+                                    "preflight_fallback": True,
+                                })
+                                if is_real_tool_content(fb_result):
+                                    tool_was_used = True
+                                    if fb_result.content:
+                                        tool_output_accum.append(fb_result.content)
+                                _extend_citation_urls(citation_urls, extract_urls(fb_result.content))
+                                fallback_used = True
+                        elif pf_result.trigger_fallback and pf_result.fallback_tool:
+                            logger.info(
+                                "Preflight fallback skipped: tool=%s not in active allowlist.",
+                                pf_result.fallback_tool,
+                            )
         except Exception:
             logger.exception("Failed building request context")
             await message.channel.send(with_turn_id(GENERIC_TECH_ERROR, turn_id))
@@ -943,7 +1057,11 @@ async def on_message(message):
                     # turn when the primary tool asked for it (e.g. OSINT
                     # returned no match → fall back to internet_search).
                     # Dedup replays suppress this via trigger_fallback=False.
-                    if result.trigger_fallback and result.fallback_tool:
+                    if (
+                        result.trigger_fallback
+                        and result.fallback_tool
+                        and result.fallback_tool in allowed_tool_names
+                    ):
                         fallback_call_id = f"autofb_{uuid.uuid4().hex[:8]}"
                         fb_args = result.fallback_args or {}
                         messages.append({
@@ -997,6 +1115,11 @@ async def on_message(message):
                             log_entry["name"], result.fallback_tool,
                             fb_args, fb_result.success,
                             fb_log_extra["latency_ms"],
+                        )
+                    elif result.trigger_fallback and result.fallback_tool:
+                        logger.info(
+                            "Auto-fallback skipped: tool=%s not in active allowlist.",
+                            result.fallback_tool,
                         )
 
             # Extract final answer
@@ -1249,7 +1372,7 @@ async def on_message(message):
                     github_tool_was_used=github_tool_was_used,
                 )
 
-                if post_issues:
+                if post_issues and ENABLE_VALIDATOR_RETRY:
                     logger.info(
                         "Validator issues remain after deterministic fixes "
                         "(pre=%s post=%s) — retrying with LLM once.",
@@ -1278,6 +1401,12 @@ async def on_message(message):
                         retry_content = rewrite_sources_as_markdown(retry_content)
                         ai_response = retry_content
                         validator_retries = 1
+                elif post_issues:
+                    logger.info(
+                        "Validator issues remain after deterministic fixes "
+                        "(pre=%s post=%s) but validator retry is disabled for this profile.",
+                        pre_issues, post_issues,
+                    )
                 elif pre_issues:
                     logger.info(
                         "Validator issues %s resolved by deterministic "

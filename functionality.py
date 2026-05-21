@@ -1,4 +1,3 @@
-import asyncio
 import re
 class functional:
     def __init__(self, bot):
@@ -9,16 +8,18 @@ class functional:
 
 #<-----------------------------------memory---------------------------------------->
 
-    async def get_message_history(self, channel, limit=5):
+    async def get_message_history(self, channel, limit=5, *, include_bot_messages=True):
         messages = []
         async for msg in channel.history(limit=limit, oldest_first=False):
-            # Include our own bot's messages, but ignore other bots
-            if msg.author == self.bot.user or not msg.author.bot:
+            # Include our own bot's messages optionally, but ignore other bots
+            if msg.author == self.bot.user:
                 # Skip embed-only messages (e.g. citation embeds the bot sends
                 # after the main answer). These have no text content and would
                 # just add noise to the history context.
-                if not (msg.author == self.bot.user and not (msg.content or "").strip()):
+                if include_bot_messages and (msg.content or "").strip():
                     messages.append(msg)
+            elif not msg.author.bot:
+                messages.append(msg)
 
         messages.reverse() 
         return messages
