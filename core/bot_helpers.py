@@ -815,3 +815,69 @@ def ensure_sources_line(
         return answer  # Already has URLs, leave it.
     lines = "\n".join(f"- {shorten_for_citation(u)}" for u in urls)
     return f"{body_before}\n\nस्रोत:\n{lines}"
+
+
+def deduplicate_paragraphs(text: str) -> str:
+    """Remove repeated paragraphs/sentences from model output.
+
+    Some smaller models loop mid-generation, repeating the same paragraph
+    2–5 times before the token limit cuts them off. This strips exact
+    duplicate blocks so the user never sees the same content twice.
+
+    Strategy:
+      - Split on double-newline (paragraph boundary).
+      - Keep the first occurrence of each paragraph; drop exact duplicates.
+      - Also deduplicate at the sentence level within each paragraph to
+        catch tighter loops ("CJP's ideology is… CJP's ideology is…").
+      - Preserve the स्रोत: block intact — it lives after the body and
+        should never be touched by this function.
+    """
+    if not text or len(text) < 80:
+        return text
+
+    # Separate body from sources block so we never mangle citations.
+    src_idx = text.rfind("स्रोत:")
+    if src_idx >= 0:
+        body = text[:src_idx]
+        sources = text[src_idx:]
+    else:
+        body = text
+        sources = ""
+
+    # ── Paragraph-level dedup ─────────────────────────────────────
+    paragraphs = body.split("\n\n")
+    seen_paras: set[str] = set()
+    unique_paras: list[str] = []
+    for para in paragraphs:
+        key = para.strip().lower()
+        if not key:
+            unique_paras.append(para)
+            continue
+        if key not in seen_paras:
+            seen_paras.add(key)
+            unique_paras.append(para)
+        # else: drop the duplicate paragraph entirely
+
+    deduped_body = "\n\n".join(unique_paras)
+
+    # ── Sentence-level dedup within each paragraph ────────────────
+    # Split on ।  (Devanagari danda) and . / ! / ? for Latin sentences.
+    _SENT_SPLIT_RE = re.compile(r"(?<=[।.!?])\s+")
+    final_paras: list[str] = []
+    for para in deduped_body.split("\n\n"):
+        sentences = _SENT_SPLIT_RE.split(para)
+        seen_sents: set[str] = set()
+        unique_sents: list[str] = []
+        for sent in sentences:
+            key = sent.strip().lower()
+            if not key:
+                unique_sents.append(sent)
+                continue
+            if key not in seen_sents:
+                seen_sents.add(key)
+                unique_sents.append(sent)
+        # Re-join with a space; preserve original spacing style.
+        final_paras.append(" ".join(s for s in unique_sents if s.strip()))
+
+    result = "\n\n".join(p for p in final_paras if p.strip())
+    return (result + "\n\n" + sources).rstrip() if sources else result.rstrip()

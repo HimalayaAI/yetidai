@@ -75,6 +75,7 @@ from core.bot_helpers import (
     build_force_tool_nudge,
     chunk_for_discord,
     classify_llm_error,
+    deduplicate_paragraphs,
     detect_fabricated_filenames,
     detect_fabricated_source_names,
     detect_fabricated_urls,
@@ -492,6 +493,11 @@ _STOP_SEQUENCES: list[str] = [
     "\n\nHuman:",
 ]
 
+# Hard cap on generated tokens. Prevents the model from looping inside a
+# single generation (repeating the same paragraph endlessly). 1024 tokens
+# is enough for the longest factual answer; small-talk replies are ~50.
+_MAX_TOKENS = int(os.getenv("YETI_MAX_TOKENS", "1024"))
+
 
 async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
     """One OpenAI round-trip with timeout and one transient retry.
@@ -510,6 +516,7 @@ async def _run_llm_turn(messages, tools_array, *, tool_choice: str | None):
                     tool_choice=tool_choice if tools_array else None,
                     temperature=0.2,
                     stop=_STOP_SEQUENCES,
+                    max_tokens=_MAX_TOKENS,
                 ),
                 timeout=TIME_OUT_SECONDS,
             )
@@ -1234,6 +1241,9 @@ async def on_message(message):
 
                 # Mechanical fixes first — cheap, don't need the LLM.
                 ai_response = normalize_digits(ai_response)
+                # Strip repeated paragraphs/sentences produced by looping
+                # models before any other fixup sees the text.
+                ai_response = deduplicate_paragraphs(ai_response)
                 if tool_was_used:
                     ai_response = ensure_sources_line(ai_response, citation_urls)
                 # Shorten any bare URLs in the स्रोत: block to Discord-markdown
@@ -1268,6 +1278,7 @@ async def on_message(message):
                     ) if retry_resp and getattr(retry_resp, "choices", None) else ""
                     if retry_content:
                         retry_content = normalize_digits(retry_content)
+                        retry_content = deduplicate_paragraphs(retry_content)
                         if tool_was_used:
                             retry_content = ensure_sources_line(
                                 retry_content, citation_urls,
