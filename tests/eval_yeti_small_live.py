@@ -37,7 +37,6 @@ if str(ROOT) not in sys.path:
 from core.bot_helpers import (  # noqa: E402
     ensure_sources_line,
     extract_urls,
-    normalize_digits,
     rewrite_sources_as_markdown,
 )
 from core.output_validator import validate_answer  # noqa: E402
@@ -271,7 +270,6 @@ async def _run_case(
 
         # Mirror bot.py deterministic post-fixes for a fair "final output" eval.
         if final_text:
-            final_text = normalize_digits(final_text)
             if tool_used:
                 final_text = ensure_sources_line(final_text, citation_urls)
             final_text = rewrite_sources_as_markdown(final_text)
@@ -300,7 +298,6 @@ async def _run_case(
                 retry_choice = retry_resp.choices[0]
                 retry_text = (retry_choice.message.content or "").strip()
                 if retry_text:
-                    retry_text = normalize_digits(retry_text)
                     if tool_used:
                         retry_text = ensure_sources_line(retry_text, citation_urls)
                     retry_text = rewrite_sources_as_markdown(retry_text)

@@ -34,7 +34,7 @@ Resilience:
   - Per-phase try/except so one failure can't masquerade as another.
   - HimalayaGPT calls wrapped in asyncio.wait_for with one transient retry.
   - Last tool-round forces tools=None so the LLM must emit text.
-  - Deterministic fixups (ASCII→Devanagari digits, स्रोत line injection)
+  - Deterministic fixups (citation shaping, स्रोत line injection)
     run before invoking a second LLM turn for validator nudges.
   - Error messages classified into distinct Nepali strings and tagged with
     the turn_id for log correlation.
@@ -100,7 +100,6 @@ from core.bot_helpers import (
     looks_like_correction,
     needs_tool_use,
     news_answer_off_topic,
-    normalize_digits,
     rewrite_sources_as_markdown,
     safe_field_value,
     split_body_and_sources,
@@ -1394,7 +1393,6 @@ async def on_message(message):
                 )
 
                 # Mechanical fixes first — cheap, don't need the LLM.
-                ai_response = normalize_digits(ai_response)
                 ai_response = deduplicate_paragraphs(ai_response)
                 if tool_was_used:
                     ai_response = ensure_sources_line(ai_response, citation_urls)
@@ -1403,7 +1401,7 @@ async def on_message(message):
                 ai_response = rewrite_sources_as_markdown(ai_response)
 
                 # Re-validate *after* fixups: if the only problems were
-                # ASCII digits and a missing स्रोत line, we've just solved
+                # citation formatting and स्रोत line, we've just solved
                 # them without burning a HimalayaGPT call.
                 post_issues = validate_answer(
                     ai_response,
@@ -1432,7 +1430,6 @@ async def on_message(message):
                         ) if retry_resp and getattr(retry_resp, "choices", None) else ""
                         if not retry_content:
                             continue
-                        retry_content = normalize_digits(retry_content)
                         retry_content = deduplicate_paragraphs(retry_content)
                         if tool_was_used:
                             retry_content = ensure_sources_line(
@@ -1503,7 +1500,6 @@ async def on_message(message):
                     ) if leak_resp and getattr(leak_resp, "choices", None) else ""
                     if not leak_content:
                         continue
-                    leak_content = normalize_digits(leak_content)
                     leak_content = deduplicate_paragraphs(leak_content)
                     if tool_was_used:
                         leak_content = ensure_sources_line(leak_content, citation_urls)

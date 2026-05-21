@@ -5,10 +5,13 @@ Runs AFTER the LLM emits the final Nepali reply. Flags violations cheaply
 so bot.py can ask Sarvam to fix them in one targeted retry.
 
 Checks:
-  1. Devanagari-digit-only in body (ASCII digits [0-9] forbidden).
-  2. `स्रोत:` citation line present when a tool was used this turn.
-  3. No long runs of pure-English prose (loanwords are fine; paragraphs aren't).
-  4. Body not empty and not trivially "माफ गर्नुहोस्…" when tool data exists.
+  1. `स्रोत:` citation line present when a tool was used this turn.
+  2. No long runs of pure-English prose (loanwords are fine; paragraphs aren't).
+  3. Body not empty and not trivially "माफ गर्नुहोस्…" when tool data exists.
+
+Optional strict mode:
+  - Enforce Devanagari digits in body text by setting
+    `enforce_devanagari_digits=True` at call-sites.
 
 Out of scope: semantic correctness, factuality, source-url validity.
 """
@@ -87,6 +90,7 @@ def validate_answer(
     tool_was_used: bool,
     github_tool_was_used: bool = True,
     min_devanagari_chars: int = 15,
+    enforce_devanagari_digits: bool = False,
 ) -> list[str]:
     """Return a list of Nepali fix instructions. Empty list = all good.
 
@@ -102,30 +106,31 @@ def validate_answer(
 
     body, sources_line = _split_body_and_sources(answer)
 
-    # (1) ASCII digits forbidden in body text (URLs in sources are ok).
-    body_no_urls = re.sub(r"https?://\S+", " ", body)
-    if re.search(r"[0-9]", body_no_urls):
-        issues.append(
-            "ASCII अङ्क (0-9) छन् — सबै देवनागरी अङ्क (०-९) मा रूपान्तरण गर्नुहोस्।"
-        )
+    # Optional strict mode: forbid ASCII digits in body text.
+    if enforce_devanagari_digits:
+        body_no_urls = re.sub(r"https?://\S+", " ", body)
+        if re.search(r"[0-9]", body_no_urls):
+            issues.append(
+                "ASCII अङ्क (0-9) छन् — सबै देवनागरी अङ्क (०-९) मा रूपान्तरण गर्नुहोस्।"
+            )
 
-    # (2) Devanagari content present.
+    # (1) Devanagari content present.
     if len(_DEVANAGARI_RE.findall(body)) < min_devanagari_chars:
         issues.append(
             "मुख्य जवाफ देवनागरी (नेपाली) मा लेखिएको छैन — पुनः नेपालीमा लेख्नुहोस्।"
         )
 
-    # (3) स्रोत: line required when tool output was available.
+    # (2) स्रोत: line required when tool output was available.
     if tool_was_used and "स्रोत:" not in answer:
         issues.append("स्रोत: रेखा थप्नुहोस् (२–४ भरपर्दो स्रोत उद्धरण गर्नुहोस्)।")
 
-    # (4) No long English paragraphs.
+    # (3) No long English paragraphs.
     if _ascii_run_length(body) > 60:
         issues.append(
             "जवाफमा लामो अङ्ग्रेजी वाक्यांश छ — सम्पूर्ण नेपालीमा अनुवाद गर्नुहोस्।"
         )
 
-    # (5) If the answer contains a `github.com/HimalayaAI/<repo>` URL but
+    # (4) If the answer contains a `github.com/HimalayaAI/<repo>` URL but
     #     no github tool was called this turn, the URL is almost certainly
     #     fabricated (the bare org URL without a suffix is allowed and
     #     does not match the regex). Ask for a rewrite using list_github_repos.
